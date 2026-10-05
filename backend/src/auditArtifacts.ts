@@ -24,6 +24,10 @@ export interface RawVuln {
   recommendation: string;
   snippet: string;
   taint_chain: string;
+  root_cause?: string;
+  endpoint?: string;
+  exploitation?: string;
+  payload?: string;
 }
 
 const SEV_MAP: Record<string, string> = {
@@ -405,7 +409,7 @@ function normalizeItem(it: any): RawVuln | null {
   // 定位：affected_files[0] / location / file 字段都可能出现
   let file = '';
   let line = 0;
-  let snippet = String(it.snippet || it.code_snippet || it.code || it.payload || '');
+  let snippet = String(it.snippet || it.code_snippet || it.code || '');
   const af = Array.isArray(it.affected_files) ? it.affected_files[0] : null;
   if (af) {
     file = String(af.file || af.path || '');
@@ -417,14 +421,8 @@ function normalizeItem(it: any): RawVuln | null {
     line = Number.isFinite(Number(it.line)) ? Number(it.line) : loc.line;
   }
 
-  // 描述：尽量富集（成因 + 利用方式 + 端点 + payload）
-  const parts: string[] = [];
-  if (it.description) parts.push(String(it.description));
-  if (it.root_cause) parts.push(`成因：${it.root_cause}`);
-  if (it.endpoint) parts.push(`入口：${it.endpoint}`);
-  if (it.exploitation) parts.push(`利用：${it.exploitation}`);
-  if (it.payload) parts.push(`Payload：${it.payload}`);
-  const description = parts.join('\n').trim() || title;
+  // 描述：仅保留原始 description；成因/入口/利用/Payload 已拆为独立字段，不再拼接
+  const description = String(it.description || '').trim() || title;
 
   // 污点链：子智能体可能用 taint_chain / taintChain / taint_flow / source_sink 等命名，
   // 也可能输出结构化数组而非字符串；normalizeTaintChain 统一转成可读逐跳文本，
@@ -440,6 +438,10 @@ function normalizeItem(it: any): RawVuln | null {
     file,
     line,
     description,
+    root_cause: String(it.root_cause || '').trim(),
+    endpoint: String(it.endpoint || '').trim(),
+    exploitation: String(it.exploitation || '').trim(),
+    payload: String(it.payload || '').trim(),
     recommendation: String(it.remediation || it.recommendation || it.fix || '').trim(),
     snippet,
     taint_chain,
