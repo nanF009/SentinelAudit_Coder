@@ -495,6 +495,37 @@ function VulnModal({ vuln, onClose }: { vuln: VulnRow; onClose: () => void }) {
             <p>{vuln.description}</p>
           </div>
         )}
+        {(vuln.root_cause || vuln.endpoint || vuln.exploitation || vuln.payload) && (
+          <div className="modal-block">
+            <h4>结构化信息</h4>
+            {vuln.root_cause && (
+              <p>
+                <strong>根因：</strong>
+                {vuln.root_cause}
+              </p>
+            )}
+            {vuln.endpoint && (
+              <p>
+                <strong>入口：</strong>
+                {vuln.endpoint}
+              </p>
+            )}
+            {vuln.exploitation && (
+              <p>
+                <strong>利用方式：</strong>
+                {vuln.exploitation}
+              </p>
+            )}
+            {vuln.payload && (
+              <>
+                <p>
+                  <strong>Payload：</strong>
+                </p>
+                <pre className="code-block">{vuln.payload}</pre>
+              </>
+            )}
+          </div>
+        )}
         {vuln.taint_chain && (
           <div className="modal-block">
             <h4>污点链（Source→Sink）</h4>

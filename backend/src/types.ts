@@ -116,6 +116,14 @@ export interface Vulnerability {
   code_snippet: string;
   /** 污点链：从用户可控输入(Source)逐跳到危险操作(Sink)的完整数据流路径。 */
   taint_chain: string;
+  /** 结构化 Finding：根因（来源子智能体产物的 root_cause；DB 为 TEXT NOT NULL DEFAULT ''）。 */
+  root_cause: string;
+  /** 结构化 Finding：入口/端点（来源 endpoint）。 */
+  endpoint: string;
+  /** 结构化 Finding：利用方式（来源 exploitation）。 */
+  exploitation: string;
+  /** 结构化 Finding：利用载荷（来源 payload）。 */
+  payload: string;
   /** 远程靶机验证成功（持久化列）。 */
   verified?: number;
   /** 触发所需权限：none/user/admin。 */

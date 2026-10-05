@@ -848,8 +848,8 @@ function saveVulnerabilities(projectId: string, vulns: any[]): void {
   const counts: Record<Severity, number> = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
   const insert = db.prepare(
     `INSERT INTO vulnerabilities
-       (id, project_id, title, severity, severity_original, regrade_value, regrade_reason, category, file_path, line, description, recommendation, code_snippet, taint_chain, auth_required, auth_reason, cluster_id, cluster_role, created_at)
-     VALUES (@id, @project_id, @title, @severity, @severity_original, @regrade_value, @regrade_reason, @category, @file_path, @line, @description, @recommendation, @code_snippet, @taint_chain, @auth_required, @auth_reason, @cluster_id, @cluster_role, @created_at)`
+       (id, project_id, title, severity, severity_original, regrade_value, regrade_reason, category, file_path, line, description, recommendation, code_snippet, taint_chain, root_cause, endpoint, exploitation, payload, auth_required, auth_reason, cluster_id, cluster_role, created_at)
+     VALUES (@id, @project_id, @title, @severity, @severity_original, @regrade_value, @regrade_reason, @category, @file_path, @line, @description, @recommendation, @code_snippet, @taint_chain, @root_cause, @endpoint, @exploitation, @payload, @auth_required, @auth_reason, @cluster_id, @cluster_role, @created_at)`
   );
   const tx = db.transaction((items: any[]) => {
     for (const v of items) {
@@ -893,6 +893,11 @@ function saveVulnerabilities(projectId: string, vulns: any[]): void {
         // 部分子智能体偶尔把污点链输出成结构化数组而非字符串；normalizeTaintChain 会把它
         // 转成可读逐跳文本，而不是像 String(array) 那样退化成 "[object Object],…"。
         taint_chain: normalizeTaintChain(v.taint_chain),
+        // 结构化 Finding：normalizeItem 已从子智能体产物拆分保留；旧 Finding 缺字段时统一落 ''。
+        root_cause: String(v.root_cause || ''),
+        endpoint: String(v.endpoint || ''),
+        exploitation: String(v.exploitation || ''),
+        payload: String(v.payload || ''),
         auth_required: ['none', 'user', 'admin'].includes(String(v.auth_required || '').toLowerCase())
           ? String(v.auth_required).toLowerCase()
           : null,
@@ -3399,7 +3404,7 @@ function loadDbVulns(projectId: string): any[] {
   try {
     return db
       .prepare(
-        'SELECT title, severity, category, file_path AS file, line, description, recommendation, snippet FROM vulnerabilities WHERE project_id = ?'
+        'SELECT title, severity, category, file_path AS file, line, description, recommendation, snippet, root_cause, endpoint, exploitation, payload FROM vulnerabilities WHERE project_id = ?'
       )
       .all(projectId) as any[];
   } catch {

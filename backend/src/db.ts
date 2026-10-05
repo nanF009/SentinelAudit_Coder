@@ -94,6 +94,10 @@ CREATE TABLE IF NOT EXISTS vulnerabilities (
   recommendation TEXT NOT NULL DEFAULT '',
   code_snippet TEXT NOT NULL DEFAULT '',
   taint_chain TEXT NOT NULL DEFAULT '',
+  root_cause TEXT NOT NULL DEFAULT '',
+  endpoint TEXT NOT NULL DEFAULT '',
+  exploitation TEXT NOT NULL DEFAULT '',
+  payload TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
@@ -269,6 +273,12 @@ ensureVulnCol('auth_reason', "auth_reason TEXT NOT NULL DEFAULT ''");
 // cluster_role=primary（代表面）/variant（其余利用面）；无簇的普通漏洞为 NULL。供前端折叠展示"1 点 N 面"。
 ensureVulnCol('cluster_id', 'cluster_id TEXT');
 ensureVulnCol('cluster_role', 'cluster_role TEXT');
+// 结构化 Finding 字段：由 auditArtifacts.normalizeItem 从子智能体产物拆分保留（不再拼进 description）。
+// 供漏洞详情页分项展示：根因 / 入口 / 利用方式 / Payload。
+ensureVulnCol('root_cause', "root_cause TEXT NOT NULL DEFAULT ''");
+ensureVulnCol('endpoint', "endpoint TEXT NOT NULL DEFAULT ''");
+ensureVulnCol('exploitation', "exploitation TEXT NOT NULL DEFAULT ''");
+ensureVulnCol('payload', "payload TEXT NOT NULL DEFAULT ''");
 
 // 旧库迁移：agent_events 增加 phase（审计阶段 audit / 验证阶段 verify），并回填历史数据
 const eventCols = db.prepare('PRAGMA table_info(agent_events)').all() as { name: string }[];

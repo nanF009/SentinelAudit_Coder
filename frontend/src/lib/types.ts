@@ -292,6 +292,14 @@ export interface Vulnerability {
   recommendation: string;
   code_snippet: string;
   taint_chain?: string;
+  /** 结构化 Finding：根因。列表接口为手写投影，可能不含该字段，故保持可选。 */
+  root_cause?: string;
+  /** 结构化 Finding：入口/端点。 */
+  endpoint?: string;
+  /** 结构化 Finding：利用方式。 */
+  exploitation?: string;
+  /** 结构化 Finding：利用载荷。 */
+  payload?: string;
   /** 远程靶机验证成功标记（持久化列）。 */
   verified?: number;
   /** 前台 RCE：远程 HTTP 验证通过的 RCE；含 none 或 reg_default_open+user。 */
