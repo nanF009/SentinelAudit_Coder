@@ -157,6 +157,24 @@ export function buildVulnMarkdown(projectId: string, title: string): string | nu
   if (ex?.local_result) {
     lines.push('## 远程验证过程', '', String(ex.local_result), '');
   }
+  // 权限降级验证（none/user/admin 三档）：整体缺失则不输出该章节；单档缺失不输出该档。
+  const priv = ex?.privilege_results;
+  const privTierBlocks = (['none', 'user', 'admin'] as const)
+    .map((tier) => {
+      const cell = priv && typeof priv === 'object' ? priv[tier] : null;
+      if (!cell || typeof cell !== 'object') return '';
+      const status = String(cell.status ?? '').trim();
+      const evidence = String(cell.evidence ?? '').trim();
+      if (!status && !evidence) return '';
+      const block: string[] = [`### ${tier}`, ''];
+      if (status) block.push(`- **状态**: ${status}`);
+      if (evidence) block.push(`- **证据**: ${evidence}`);
+      return block.join('\n');
+    })
+    .filter(Boolean);
+  if (privTierBlocks.length > 0) {
+    lines.push('## 权限降级验证', '', privTierBlocks.join('\n\n'), '');
+  }
   if (ex?.detail) {
     lines.push('## 利用细节', '', String(ex.detail), '');
   }

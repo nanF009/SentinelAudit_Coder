@@ -114,12 +114,33 @@ function buildExploitSection(reportJson: string | null): string {
           </div>`
         )
         .join('');
+      // 权限降级验证（none/user/admin 三档）：整体缺失则不渲染该子块，单档缺失跳过该档。
+      const priv = ex.privilege_results;
+      const privRows = (['none', 'user', 'admin'] as const)
+        .map((tier) => {
+          const cell = priv && typeof priv === 'object' ? priv[tier] : null;
+          if (!cell || typeof cell !== 'object') return '';
+          const status = String(cell.status ?? '').trim();
+          const evidence = String(cell.evidence ?? '').trim();
+          if (!status && !evidence) return '';
+          return `<div class="ver-row">
+            <span class="ver-tag">${tier}</span>
+            ${status ? `<strong>${esc(status)}</strong>` : ''}
+            ${evidence ? `<span class="ver-note">${esc(evidence)}</span>` : ''}
+          </div>`;
+        })
+        .filter(Boolean)
+        .join('');
+      const privBlock = privRows
+        ? `<div class="vuln-block"><h4>权限降级验证</h4><div class="ver-list">${privRows}</div></div>`
+        : '';
       return `<section class="exp-card">
         <div class="exp-head">
           <span class="exp-badge" style="background:${st.color}">${st.text}</span>
           <h3 class="exp-title">${esc(ex.vulnerability)}</h3>
         </div>
         ${ex.local_result ? `<div class="vuln-block"><h4>验证过程与证据</h4><p>${esc(ex.local_result)}</p></div>` : ''}
+        ${privBlock}
         ${ex.detail ? `<div class="vuln-block"><h4>利用链细节</h4><p>${esc(ex.detail)}</p></div>` : ''}
         ${versionRows ? `<div class="vuln-block"><h4>可成功利用的历史版本</h4><div class="ver-list">${versionRows}</div></div>` : ''}
       </section>`;
@@ -133,12 +154,24 @@ function buildExploitSection(reportJson: string | null): string {
       const steps: any[] = Array.isArray(c.steps) ? c.steps : [];
       const versions: any[] = Array.isArray(c.exploitable_versions) ? c.exploitable_versions : [];
       const stepList = steps
-        .map(
-          (s) =>
-            `<li>${s.vulnerability ? `<strong>${esc(s.vulnerability)}</strong> ` : ''}${esc(
-              s.description || ''
-            )}</li>`
-        )
+        .map((s) => {
+          const step = s && typeof s === 'object' ? s : { description: String(s ?? '') };
+          // 逐步运行证据（result / evidence.details / url_accessed / http_status）：
+          // 旧数据缺 evidence 时全部跳过，只渲染原有的 vulnerability + description。
+          const ev =
+            step.evidence && typeof step.evidence === 'object' && !Array.isArray(step.evidence)
+              ? step.evidence
+              : null;
+          const meta: string[] = [];
+          if (step.result) meta.push(`结果：${esc(String(step.result))}`);
+          if (ev?.details) meta.push(`证据：${esc(String(ev.details))}`);
+          if (ev?.url_accessed) meta.push(`请求：${esc(String(ev.url_accessed))}`);
+          if (ev && ev.http_status != null && String(ev.http_status).trim() !== '')
+            meta.push(`HTTP：${esc(String(ev.http_status))}`);
+          return `<li>${step.vulnerability ? `<strong>${esc(step.vulnerability)}</strong> ` : ''}${esc(
+            step.description || ''
+          )}${meta.length ? `<div class="ver-note">${meta.join(' · ')}</div>` : ''}</li>`;
+        })
         .join('');
       const versionRows = versions
         .map(
