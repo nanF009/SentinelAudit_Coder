@@ -134,6 +134,65 @@ function buildExploitSection(reportJson: string | null): string {
       const privBlock = privRows
         ? `<div class="vuln-block"><h4>权限降级验证</h4><div class="ver-list">${privRows}</div></div>`
         : '';
+      // 可复现信息（Runtime 实际执行）：任一有效字段才渲染；缺失或全空则不渲染该区块。
+      const repro =
+        ex.reproduction && typeof ex.reproduction === 'object' && !Array.isArray(ex.reproduction)
+          ? ex.reproduction
+          : null;
+      const reproTxt = (value: unknown) => String(value ?? '').trim();
+      const reproReq =
+        repro?.request && typeof repro.request === 'object' && !Array.isArray(repro.request)
+          ? repro.request
+          : null;
+      const reproRes =
+        repro?.response && typeof repro.response === 'object' && !Array.isArray(repro.response)
+          ? repro.response
+          : null;
+      const reproReqText = reproReq
+        ? [
+            reproTxt(reproReq.method) || reproTxt(reproReq.url)
+              ? `${reproTxt(reproReq.method)} ${reproTxt(reproReq.url)}`.trim()
+              : '',
+            reproTxt(reproReq.headers),
+            reproTxt(reproReq.body),
+          ]
+            .filter(Boolean)
+            .join('\n')
+        : '';
+      const reproResText = reproRes
+        ? [
+            reproRes.status != null && String(reproRes.status).trim() !== ''
+              ? `HTTP ${String(reproRes.status).trim()}`
+              : '',
+            reproTxt(reproRes.headers),
+            reproTxt(reproRes.body),
+          ]
+            .filter(Boolean)
+            .join('\n')
+        : '';
+      const reproType = reproTxt(repro?.type);
+      const reproCommand = reproTxt(repro?.command);
+      const reproOutput = reproTxt(repro?.output);
+      const reproItems = [
+        reproType ? `<div class="ver-note">类型：${esc(reproType)}</div>` : '',
+        reproReqText
+          ? `<div><div class="ver-note">请求</div><pre>${esc(reproReqText)}</pre></div>`
+          : '',
+        reproResText
+          ? `<div><div class="ver-note">响应</div><pre>${esc(reproResText)}</pre></div>`
+          : '',
+        reproCommand
+          ? `<div><div class="ver-note">命令</div><pre>${esc(reproCommand)}</pre></div>`
+          : '',
+        reproOutput
+          ? `<div><div class="ver-note">执行输出</div><pre>${esc(reproOutput)}</pre></div>`
+          : '',
+      ].filter(Boolean);
+      const reproBlock = reproItems.length
+        ? `<div class="vuln-block"><h4>可复现信息</h4><div class="ver-list">${reproItems.join(
+            ''
+          )}</div></div>`
+        : '';
       return `<section class="exp-card">
         <div class="exp-head">
           <span class="exp-badge" style="background:${st.color}">${st.text}</span>
@@ -142,6 +201,7 @@ function buildExploitSection(reportJson: string | null): string {
         ${ex.local_result ? `<div class="vuln-block"><h4>验证过程与证据</h4><p>${esc(ex.local_result)}</p></div>` : ''}
         ${privBlock}
         ${ex.detail ? `<div class="vuln-block"><h4>利用链细节</h4><p>${esc(ex.detail)}</p></div>` : ''}
+        ${reproBlock}
         ${versionRows ? `<div class="vuln-block"><h4>可成功利用的历史版本</h4><div class="ver-list">${versionRows}</div></div>` : ''}
       </section>`;
     })
@@ -168,9 +228,49 @@ function buildExploitSection(reportJson: string | null): string {
           if (ev?.url_accessed) meta.push(`请求：${esc(String(ev.url_accessed))}`);
           if (ev && ev.http_status != null && String(ev.http_status).trim() !== '')
             meta.push(`HTTP：${esc(String(ev.http_status))}`);
+          // 逐步复现信息（Runtime 实际执行，全部可选）：缺失一律不渲染。
+          const evTxt = (value: unknown) => String(value ?? '').trim();
+          const evReq =
+            ev && ev.request && typeof ev.request === 'object' && !Array.isArray(ev.request)
+              ? ev.request
+              : null;
+          const evRes =
+            ev && ev.response && typeof ev.response === 'object' && !Array.isArray(ev.response)
+              ? ev.response
+              : null;
+          const evReqText = evReq
+            ? [
+                evTxt(evReq.method) || evTxt(evReq.url)
+                  ? `${evTxt(evReq.method)} ${evTxt(evReq.url)}`.trim()
+                  : '',
+                evTxt(evReq.headers),
+                evTxt(evReq.body),
+              ]
+                .filter(Boolean)
+                .join('\n')
+            : '';
+          const evResText = evRes
+            ? [
+                evRes.status != null && String(evRes.status).trim() !== ''
+                  ? `HTTP ${String(evRes.status).trim()}`
+                  : '',
+                evTxt(evRes.headers),
+                evTxt(evRes.body),
+              ]
+                .filter(Boolean)
+                .join('\n')
+            : '';
+          const evCommand = evTxt(ev?.command);
+          const evOutput = evTxt(ev?.output);
+          const evExtra = [
+            evReqText ? `<div class="ver-note">请求</div><pre>${esc(evReqText)}</pre>` : '',
+            evResText ? `<div class="ver-note">响应</div><pre>${esc(evResText)}</pre>` : '',
+            evCommand ? `<div class="ver-note">命令</div><pre>${esc(evCommand)}</pre>` : '',
+            evOutput ? `<div class="ver-note">执行输出</div><pre>${esc(evOutput)}</pre>` : '',
+          ].join('');
           return `<li>${step.vulnerability ? `<strong>${esc(step.vulnerability)}</strong> ` : ''}${esc(
             step.description || ''
-          )}${meta.length ? `<div class="ver-note">${meta.join(' · ')}</div>` : ''}</li>`;
+          )}${meta.length ? `<div class="ver-note">${meta.join(' · ')}</div>` : ''}${evExtra}</li>`;
         })
         .join('');
       const versionRows = versions

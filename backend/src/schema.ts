@@ -300,6 +300,86 @@ const HISTORICAL_VERIFICATION_SCHEMA = {
   },
 };
 
+/**
+ * 「可复现信息」子结构（单漏洞 reproduction 与组合链 step evidence 共用）。
+ * 全部字段 optional：HTTP / 命令执行 / 文件读写 / RCE 的复现形态不同，不强制统一结构；
+ * 拿不到可靠值就省略，不得编造。长度上限由 Prompt 约束（单字段建议 ≤ 约 4KB）。
+ */
+const REPRO_REQUEST_SCHEMA = {
+  type: 'object',
+  description:
+    '【可选】最小可复现 HTTP 请求。无法可靠确认时整体省略，不要编造。' +
+    'headers 仅保留必要项、body 仅保留最小可复现内容（建议 ≤ 约 4KB）。',
+  properties: {
+    method: { type: 'string', description: 'HTTP 方法，如 GET / POST。' },
+    url: { type: 'string', description: '完整请求 URL。' },
+    headers: { type: 'string', description: '仅必要请求头（不要整份 headers）。' },
+    body: { type: 'string', description: '请求体（仅最小可复现内容）。' },
+  },
+};
+
+const REPRO_RESPONSE_SCHEMA = {
+  type: 'object',
+  description:
+    '【可选】最小关键响应证明。不要保存完整响应/完整 HTML 页面/二进制内容，' +
+    'response.body 只保留关键证明片段（建议 ≤ 约 4KB）。',
+  properties: {
+    status: { type: 'integer', description: 'HTTP 状态码。' },
+    headers: { type: 'string', description: '仅必要响应头。' },
+    body: { type: 'string', description: '关键证明片段（不要整页内容）。' },
+  },
+};
+
+const REPRODUCTION_SCHEMA = {
+  type: 'object',
+  description:
+    '【可选】本次 Runtime 实际执行并确认的最小可复现信息（非静态推测）。' +
+    '仅当能可靠提取时填写；无法可靠确认请整体省略。' +
+    '⚠ 严禁把审计阶段推断的 payload 直接填入——除非它确实在本次验证中真实执行过。',
+  properties: {
+    type: {
+      type: 'string',
+      enum: ['http', 'command', 'mixed'],
+      description: '复现形态：http=HTTP 请求/响应；command=命令/脚本执行；mixed=两者皆有。可选。',
+    },
+    command: {
+      type: 'string',
+      description: '【可选】实际执行过的最小可复现命令/脚本（避免大段日志，建议 ≤ 约 4KB）。',
+    },
+    request: REPRO_REQUEST_SCHEMA,
+    response: REPRO_RESPONSE_SCHEMA,
+    output: {
+      type: 'string',
+      description: '【可选】命令执行/利用成功后的最小关键回显（避免大段日志，建议 ≤ 约 4KB）。',
+    },
+  },
+};
+
+/**
+ * 「可选复现信息」回填要求（三处远程验证 Prompt 共用）。
+ * 语义红线：reproduction 只能来自本次 Runtime 真实执行，禁止用静态审计 payload 顶替。
+ */
+const REPRODUCTION_GUIDE = `# 可选回填：Runtime 复现信息（reproduction / 组合链 step evidence）
+在完成真实利用并**能可靠确认**时，额外回填结构化复现信息，供报告生成「可复现 PoC」。**全部字段可选**：
+- **单漏洞 \`reproduction\`**：\`{ type: 'http'|'command'|'mixed', command?, request?{method,url,headers,body}, response?{status,headers,body}, output? }\`
+- **组合链 \`steps[].evidence\`**：在已有 \`details / url_accessed / http_status\` 之外，可再补 \`request?{method,url,headers,body}\`、\`response?{status,headers,body}\`、\`command?\`、\`output?\`（每一步各自按实际情况记录）
+
+# ⚠ 语义红线（必须遵守）
+1. \`reproduction\` 是「**本次 Runtime 实际执行过并能确认**」的复现信息，**不是静态推测**；它与审计阶段的 \`payload\` 字段无任何关系。
+2. **严禁**把审计阶段推断的 \`payload\` 直接复制成 \`reproduction\`——除非该 payload **确实在本次验证中被真实执行过**。
+3. **拿不到可靠值就整体省略该字段**：不要编造、不要用自然语言猜测代替结构化值、不要为凑字段而填写。
+4. 旧记录没有这些字段是**正常**的，不影响结论有效性。
+
+# 记录要点（按漏洞类型）
+- **HTTP 类**：尽可能记录最小可复现请求（method / url / 仅必要 headers / 仅必要 body）；若能确认响应，记录最小关键响应（status / 必要 headers / 关键证明片段）。
+- **RCE / 命令类**：尽可能记录 command 与 output（真实回显的关键片段即可）。
+- **文件读写类**：尽可能记录触发请求或 command，以及关键结果（写入路径 / 读取到的关键内容片段）。
+- **组合链**：**每一步**都可选记录 request / response / command / output（能记哪一步记哪一步）。
+
+# 长度控制（硬性）
+- 只保存**最小可复现信息 / 最小关键证明**，避免完整响应、大段日志、完整页面与二进制内容。
+- 单字段建议上限：\`command\` ≤ 约 4KB、\`output\` ≤ 约 4KB、request body ≤ 约 4KB、response body ≤ 约 4KB；\`headers\` 只保留必要项。`;
+
 export const EXPLOIT_SCHEMA = {
   type: 'object',
   properties: {
@@ -411,6 +491,7 @@ export const EXPLOIT_SCHEMA = {
           },
           detail: { type: 'string', description: '利用链与技术细节（中文）' },
           historical_verification: HISTORICAL_VERIFICATION_SCHEMA,
+          reproduction: REPRODUCTION_SCHEMA,
         },
         required: ['vulnerability', 'remote_status'],
       },
@@ -451,6 +532,27 @@ export const EXPLOIT_SCHEMA = {
               properties: {
                 vulnerability: { type: 'string', description: '该步骤利用的漏洞标题（中文）' },
                 description: { type: 'string', description: '该步骤的动作与作用（中文）' },
+                evidence: {
+                  type: 'object',
+                  description:
+                    '【可选】该步骤的逐步运行证据。全部字段可选：能可靠提取才填，缺失即省略，不得编造。' +
+                    '单字段建议 ≤ 约 4KB，只保留最小关键证明。',
+                  properties: {
+                    details: { type: 'string', description: '【可选】证据叙述（中文）。' },
+                    url_accessed: { type: 'string', description: '【可选】访问到的 URL。' },
+                    http_status: { type: 'integer', description: '【可选】HTTP 状态码。' },
+                    request: REPRO_REQUEST_SCHEMA,
+                    response: REPRO_RESPONSE_SCHEMA,
+                    command: {
+                      type: 'string',
+                      description: '【可选】该步骤实际执行过的最小命令（建议 ≤ 约 4KB）。',
+                    },
+                    output: {
+                      type: 'string',
+                      description: '【可选】该步骤执行成功后的最小关键回显（建议 ≤ 约 4KB）。',
+                    },
+                  },
+                },
               },
               required: ['description'],
             },
@@ -1843,13 +1945,15 @@ ${authRemoteIndependentRule(dir)}
 
 ${includeHistory ? historyGuide(dir) : NO_HISTORY_NOTE}
 
+${REPRODUCTION_GUIDE}
+
 # 输出要求
 严格按指定 JSON Schema，通过 StructuredOutput 提交一个对象：
 - exploits 数组必须**覆盖本批上面每一个漏洞**（${batch.length} 条，按顺序一一对应，不得遗漏/新增/合并），每条含 vulnerability_id（原样回填）、vulnerability、local_exploitable（源码/本地证据）、remote_status（远程权威结论）、local_result、**如实填写的 auth_required（必须与 privilege_results/local_result 一致，不得矛盾）**、${
     includeHistory
       ? 'historical_verification（必填）、exploitable_versions（受限时）'
       : 'historical_verification（留空数组 []）'
-  }。
+  }、reproduction（**可选**：本次实际执行的复现信息，见上「Runtime 复现信息」，拿不到可靠值则省略）。
 - **本阶段不要输出组合链**，chains 留空数组 []（组合链在后续统一阶段处理）。
 所有文本用简体中文。`;
 }
@@ -1977,11 +2081,14 @@ ${crossLangBlock}
 
 ${includeHistory ? historyGuide(dir) : NO_HISTORY_NOTE}
 
+${REPRODUCTION_GUIDE}
+
 # 输出要求
 StructuredOutput 兜底：{ exploits: [], chains: [...], summary }，chains 必须逐项覆盖 \`${manifestFile}\` 中的全部 chain_id；同时以磁盘 \`${chainsDir}/\` 为准。
 每条 chain 含 chain_id、name、impact、**auth_required（仅 none 或 user）**、status（仅 success/failed/restricted）、steps、detail、${
     includeHistory ? 'historical_verification（必填）、exploitable_versions' : 'historical_verification（留空 []）'
   }。
+每条 chain 的 \`steps[]\` 中，**每一步**除 vulnerability / description 外都可选回填 \`evidence\`：已有的 \`details\` / \`url_accessed\` / \`http_status\`，以及新增的 \`request\` / \`response\` / \`command\` / \`output\`（见上「Runtime 复现信息」；能记哪一步记哪一步，拿不到可靠值就省略，不得编造）。
 - **chains 只放 RCE / 完全接管 终点、且起点为 none/user 的组合链**：信息泄露/越权/SSRF/权限提升(未到 RCE)、以及 **admin → RCE** 等**一律不要写入**（后端会强制丢弃）。没有能到 RCE 的链就 \`chains: []\`。
 - 单个漏洞即可达成的利用**不要**放进 chains。所有文本用简体中文。`;
 }
@@ -2110,13 +2217,15 @@ ${batchPlan}
 1. **单漏洞验证结果目录**：\`${exploitsDir}/\`
    - 每完成一个漏洞就立即单独原子落盘，禁止等整组结束才一起写：先写 \`${exploitsDir}/<vulnerability_id>.json.tmp\`，JSON 序列化并读回校验成功后再 rename 为 \`${exploitsDir}/<vulnerability_id>.json\`。后端忽略 \`.tmp\`，因此不会读到半文件。
    - 每个最终 \`.json\` 文件是一个**严格合法的单元素 JSON 数组**，元素字段：
-     \`vulnerability_id\`（清单中的稳定 ID，必须原样回填）、\`vulnerability\`（漏洞标题，须与上面清单一致）、\`local_exploitable\`（源码/本地证据，只能 success/failed/restricted/unknown）、\`remote_status\`（**远程权威结论，只能 success/failed/restricted；仅权限矩阵至少一档真实动态触发成功才可填 success；源码确认但无入口、未在 HTTP 靶机触发、环境不满足均填 restricted**）、\`local_result\`（过程与证据，中文）、\`auth_required\`（none/user/admin，填**成功利用所需的最低权限**）、\`privilege_results\`（**权限降级矩阵**，见下）、\`impacts\`（**多危害能力清单**，见下）、\`detail\`（技术细节）、\`exploitable_versions\`（受限时给可利用版本）、\`historical_verification\`（${includeHistory ? '必填，逐版本 version/github_url/status/method/fix_commit/reason' : '留空数组 []'}）。
+     \`vulnerability_id\`（清单中的稳定 ID，必须原样回填）、\`vulnerability\`（漏洞标题，须与上面清单一致）、\`local_exploitable\`（源码/本地证据，只能 success/failed/restricted/unknown）、\`remote_status\`（**远程权威结论，只能 success/failed/restricted；仅权限矩阵至少一档真实动态触发成功才可填 success；源码确认但无入口、未在 HTTP 靶机触发、环境不满足均填 restricted**）、\`local_result\`（过程与证据，中文）、\`auth_required\`（none/user/admin，填**成功利用所需的最低权限**）、\`privilege_results\`（**权限降级矩阵**，见下）、\`impacts\`（**多危害能力清单**，见下）、\`detail\`（技术细节）、\`exploitable_versions\`（受限时给可利用版本）、\`historical_verification\`（${includeHistory ? '必填，逐版本 version/github_url/status/method/fix_commit/reason' : '留空数组 []'}）、\`reproduction\`（**可选**：本次实际执行的复现信息，见下「Runtime 复现信息」，拿不到可靠值则省略）。
    - **\`privilege_results\`（务必逐档实测回填）**：对象 \`{ none:{status,evidence?}, user:{status,evidence?}, admin:{status,evidence?} }\`，分别记录在【无权限/匿名】【普通用户(含开放注册自助账号)】【管理员】三种权限下的实测结果；status 取 success/failed/restricted/skipped/unknown。**必须先用无权限打，再依次升级**，如实记录每一档能否成功。\`auth_required\` 必须等于本矩阵中【success 的最低档】（none<user<admin）。
    - **\`impacts\`（多危害能力清单）**：数组，逐项列出该漏洞成功后能造成的所有危害/能力（如「任意文件写入」「任意文件读取」「信息泄露」「命令执行」「越权访问」「凭据泄露」「SSRF」等）。一个漏洞往往不止一种危害，务必列全，供后端组合链阶段按能力拼接。
    - ⚠ 严格 JSON：字符串内双引号转义为 \\"，换行用 \\n，无尾随逗号、不要 markdown 包裹；建议编程序列化后读回校验。
 2. **组合链结果文件**：\`${chainsFile}\` —— **本会话不要写入**（留空，由后端阶段二处理）。
 
 ${EXPLOIT_GUIDE}
+
+${REPRODUCTION_GUIDE}
 
 ${authRemoteIndependentRule(dir)}
 （务必把本节全文逐字转达给每个 单漏洞远程验证 子智能体：清单里的 auth_required 只是代码层线索，一律先匿名实打，实测结论覆盖代码层标注。）

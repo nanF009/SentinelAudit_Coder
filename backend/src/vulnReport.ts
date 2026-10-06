@@ -91,6 +91,50 @@ export function buildPocText(projectId: string, title: string): string | null {
   if (ex.detail) {
     lines.push('## 技术细节', String(ex.detail), '');
   }
+  // 可复现信息（Runtime 实际执行）：仅当 exploit 带 reproduction 且至少一个有效字段时追加；
+  // 旧数据没有 reproduction 时保持原有输出完全不变。
+  const repro =
+    ex.reproduction && typeof ex.reproduction === 'object' && !Array.isArray(ex.reproduction)
+      ? ex.reproduction
+      : null;
+  if (repro) {
+    const txt = (value: unknown) => String(value ?? '').trim();
+    const req =
+      repro.request && typeof repro.request === 'object' && !Array.isArray(repro.request)
+        ? repro.request
+        : null;
+    const res =
+      repro.response && typeof repro.response === 'object' && !Array.isArray(repro.response)
+        ? repro.response
+        : null;
+    const reqText = req
+      ? [txt(req.method) || txt(req.url) ? `${txt(req.method)} ${txt(req.url)}`.trim() : '', txt(req.headers), txt(req.body)]
+          .filter(Boolean)
+          .join('\n')
+      : '';
+    const resText = res
+      ? [
+          res.status != null && String(res.status).trim() !== ''
+            ? `HTTP ${String(res.status).trim()}`
+            : '',
+          txt(res.headers),
+          txt(res.body),
+        ]
+          .filter(Boolean)
+          .join('\n')
+      : '';
+    const reproType = txt(repro.type);
+    const command = txt(repro.command);
+    const output = txt(repro.output);
+    if (reproType || reqText || resText || command || output) {
+      lines.push('REPRODUCTION', '');
+      if (reproType) lines.push(`TYPE: ${reproType}`, '');
+      if (reqText) lines.push('REQUEST', '```', reqText, '```', '');
+      if (resText) lines.push('RESPONSE', '```', resText, '```', '');
+      if (command) lines.push('COMMAND', '```', command, '```', '');
+      if (output) lines.push('OUTPUT', '```', output, '```', '');
+    }
+  }
   if (v.target_url) lines.push(`靶机地址: ${v.target_url}`, '');
   return lines.join('\n').trim();
 }
@@ -177,6 +221,53 @@ export function buildVulnMarkdown(projectId: string, title: string): string | nu
   }
   if (ex?.detail) {
     lines.push('## 利用细节', '', String(ex.detail), '');
+  }
+  // 可复现信息（Runtime 实际执行）：任一有效字段才输出该章节；整体缺失或全空则不出现。
+  const repro =
+    ex?.reproduction && typeof ex.reproduction === 'object' && !Array.isArray(ex.reproduction)
+      ? ex.reproduction
+      : null;
+  const reproTxt = (value: unknown) => String(value ?? '').trim();
+  const reproReq =
+    repro && repro.request && typeof repro.request === 'object' && !Array.isArray(repro.request)
+      ? repro.request
+      : null;
+  const reproRes =
+    repro && repro.response && typeof repro.response === 'object' && !Array.isArray(repro.response)
+      ? repro.response
+      : null;
+  const reproReqText = reproReq
+    ? [
+        reproTxt(reproReq.method) || reproTxt(reproReq.url)
+          ? `${reproTxt(reproReq.method)} ${reproTxt(reproReq.url)}`.trim()
+          : '',
+        reproTxt(reproReq.headers),
+        reproTxt(reproReq.body),
+      ]
+        .filter(Boolean)
+        .join('\n')
+    : '';
+  const reproResText = reproRes
+    ? [
+        reproRes.status != null && String(reproRes.status).trim() !== ''
+          ? `HTTP ${String(reproRes.status).trim()}`
+          : '',
+        reproTxt(reproRes.headers),
+        reproTxt(reproRes.body),
+      ]
+        .filter(Boolean)
+        .join('\n')
+    : '';
+  const reproType = reproTxt(repro?.type);
+  const reproCommand = reproTxt(repro?.command);
+  const reproOutput = reproTxt(repro?.output);
+  if (reproType || reproReqText || reproResText || reproCommand || reproOutput) {
+    lines.push('## 可复现信息', '');
+    if (reproType) lines.push('### 类型', '', reproType, '');
+    if (reproReqText) lines.push('### 请求', '', '```', reproReqText, '```', '');
+    if (reproResText) lines.push('### 响应', '', '```', reproResText, '```', '');
+    if (reproCommand) lines.push('### 命令', '', '```', reproCommand, '```', '');
+    if (reproOutput) lines.push('### 执行输出', '', '```', reproOutput, '```', '');
   }
   const hist = Array.isArray(ex?.historical_verification) ? ex.historical_verification : [];
   const okHist = hist.filter((h: any) => h?.status === 'success');
