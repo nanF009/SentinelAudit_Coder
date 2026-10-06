@@ -131,6 +131,20 @@ export function buildVulnMarkdown(projectId: string, title: string): string | nu
     '',
   ].filter((l) => l !== '');
 
+  // 结构化 Finding 字段（逐项渲染：单项为空不输出；四项全空则不产生任何小节）。
+  if (v.root_cause) {
+    lines.push('## 根因', '', v.root_cause, '');
+  }
+  if (v.endpoint) {
+    lines.push('## 入口', '', v.endpoint, '');
+  }
+  if (v.exploitation) {
+    lines.push('## 利用方式', '', v.exploitation, '');
+  }
+  if (v.payload) {
+    lines.push('## Payload', '', '```', v.payload, '```', '');
+  }
+
   if (v.taint_chain) {
     lines.push('## 污点链', '', v.taint_chain, '');
   }

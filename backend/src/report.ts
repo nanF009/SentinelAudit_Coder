@@ -211,6 +211,24 @@ export function generateReport(projectId: string): string | null {
         ${v.file_path ? `<span>位置：${esc(v.file_path)}${v.line ? `:${v.line}` : ''}</span>` : ''}
       </div>
       ${v.description ? `<div class="vuln-block"><h4>问题描述</h4><p>${esc(v.description)}</p></div>` : ''}
+      ${
+        v.root_cause || v.endpoint || v.exploitation || v.payload
+          ? [
+              v.root_cause
+                ? `<div class="vuln-block"><h4>根因</h4><p>${esc(v.root_cause)}</p></div>`
+                : '',
+              v.endpoint
+                ? `<div class="vuln-block"><h4>入口</h4><p>${esc(v.endpoint)}</p></div>`
+                : '',
+              v.exploitation
+                ? `<div class="vuln-block"><h4>利用方式</h4><p>${esc(v.exploitation)}</p></div>`
+                : '',
+              v.payload
+                ? `<div class="vuln-block"><h4>Payload</h4><pre>${esc(v.payload)}</pre></div>`
+                : '',
+            ].join('')
+          : ''
+      }
       ${v.taint_chain ? `<div class="vuln-block"><h4>污点链（Source→Sink）</h4><pre>${esc(v.taint_chain)}</pre></div>` : ''}
       ${v.code_snippet ? `<div class="vuln-block"><h4>相关代码</h4><pre>${esc(v.code_snippet)}</pre></div>` : ''}
       ${v.recommendation ? `<div class="vuln-block"><h4>修复建议</h4><p>${esc(v.recommendation)}</p></div>` : ''}
