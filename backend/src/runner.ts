@@ -1418,6 +1418,7 @@ function runPiStage(
       template,
       prompt,
       schemaStr,
+      channel,
     });
     promptFileToClean = promptFile;
     runLog.append('prompt', fullPrompt);
@@ -3261,6 +3262,77 @@ async function runAuditPostSubagentPhase(
 }
 
 /**
+ * 子智能体结构化结果的旁路记录（projectId → agentType → structured）。
+ * 只服务于「磁盘 JSON 缺失、但该路已有合法 structured 结果」时的最小物化兜底，
+ * 不参与调度 / 并发 / watchdog / 覆盖率判定。每次 doAudit 开始时清空。
+ */
+const subagentStructuredResults = new Map<string, Map<string, any>>();
+
+function clearSubagentStructured(projectId: string): void {
+  subagentStructuredResults.delete(projectId);
+}
+
+function recordSubagentStructured(projectId: string, agentType: string, structured: any): void {
+  if (!structured || !Array.isArray(structured.vulnerabilities)) return;
+  let byAgent = subagentStructuredResults.get(projectId);
+  if (!byAgent) {
+    byAgent = new Map();
+    subagentStructuredResults.set(projectId, byAgent);
+  }
+  byAgent.set(agentType, structured);
+}
+
+/**
+ * 覆盖率硬闸之前的最小物化兜底：若某路子智能体已有合法 structured 结果却没落盘，
+ * 就按规范路径 `<codeDir>/JSON/<agentType>.json` 物化成产物（格式与子智能体正常写盘一致）。
+ * - 仅在「该 agent 尚无有效产物」且「structured.vulnerabilities 是数组」时写入；
+ * - 不改动 coverage 判定算法，也不影响正常的 write 落盘路径（已有有效产物则跳过）；
+ * - 物化失败不静默：记录事件后继续，让既有 coverage failure 行为照常发生。
+ */
+function materializeSubagentStructuredArtifacts(
+  projectId: string,
+  codeDir: string,
+  agents: string[]
+): void {
+  const byAgent = subagentStructuredResults.get(projectId);
+  if (!byAgent || byAgent.size === 0) return;
+  const jsonDir = path.join(codeDir, 'JSON');
+  for (const agent of agents) {
+    const structured = byAgent.get(agent);
+    if (!structured || !Array.isArray(structured.vulnerabilities)) continue;
+    const file = path.join(jsonDir, `${agent}.json`);
+    // 已有合法产物（模型自己写的 / 之前物化的）：不动正常路径的结果。
+    if (hasSubagentArtifact(file)) continue;
+    try {
+      fs.mkdirSync(jsonDir, { recursive: true });
+      fs.writeFileSync(
+        file,
+        JSON.stringify(
+          { summary: String(structured.summary || ''), vulnerabilities: structured.vulnerabilities },
+          null,
+          2
+        ),
+        'utf8'
+      );
+      recordEvent(projectId, {
+        kind: 'system',
+        agent: '产物物化器',
+        tool: '',
+        text: `✓ 子智能体 ${agent} 未落盘 JSON，已用其 structured 结果物化 JSON/${agent}.json（${structured.vulnerabilities.length} 条）`,
+      });
+    } catch (err: any) {
+      recordEvent(projectId, {
+        kind: 'system',
+        agent: '产物物化器',
+        tool: '',
+        text: `⚠ 子智能体 ${agent} 的 structured 物化失败：${err?.message || err}（按原有覆盖率硬闸判定）`,
+      });
+    }
+  }
+  byAgent.clear();
+}
+
+/**
  * 多智能体审计：N 路专项并发挖洞。收口由后端 Promise.all + 覆盖核对完成，不再另拉主控 Pi
  *（旧主控会 sleep 轮询 JSON，把页面卡在「仍无产出，继续等待」）。
  */
@@ -3315,6 +3387,8 @@ async function runSpecialtyAgents(
         { channel: 'subagent' }
       );
       last = r;
+      // 旁路记录该路的结构化结果，供覆盖率硬闸前的最小物化兜底使用（不影响主干流程）。
+      recordSubagentStructured(projectId, type, r.structured);
       if (r.killed) killed = true;
       if (r.timedOut) timedOut = true;
       if (r.killed) return;
@@ -3356,6 +3430,7 @@ async function doAudit(projectId: string): Promise<void> {
   if (!project) return;
 
   clearAuditResults(projectId);
+  clearSubagentStructured(projectId);
   setAuditStatus(projectId, 'running', { started_at: now(), error_message: null });
   recordEvent(projectId, { kind: 'system', agent: '主控', tool: '', text: '正在准备审计目标（解压/克隆源码）…' });
   // 选了完整靶机：源码尚未解压完也先入队，与审计共用工作区锁、独立 Pi 槽并行搭站。
@@ -3394,6 +3469,8 @@ async function doAudit(projectId: string): Promise<void> {
     const cov = await ensureSubagentCoverage(projectId, codeDir);
     if (cov.killed) return;
   }
+  // 最小兜底：磁盘 JSON 缺失但该路已有合法 structured 结果时，先物化成规范产物再进覆盖率硬闸。
+  materializeSubagentStructuredArtifacts(projectId, codeDir, agents);
   if (!assertAuditCoverageComplete(projectId, codeDir)) return;
 
   await runAuditPostSubagentPhase(projectId, codeDir, {

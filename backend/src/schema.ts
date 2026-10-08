@@ -689,9 +689,16 @@ export function buildSpecialtyAgentPrompt(dir: string, agentType: string): strin
 # 任务
 对目录 ${dir} 中的源码做静态安全审计，范围仅限：${subagentMission(agentType)}。
 
-# 产物
+# 产物与完成契约（唯一完成判定）
 源码目录 ${dir} 只读。禁止改源码、禁止使用 MCP。
-结果必须写入 \`${jsonPath}\`：顶层数组，或含 findings/vulnerabilities/issues 的对象。0 发现也要写合法空数组 \`[]\`。
+必须把结果写入 \`${jsonPath}\`：顶层数组，或含 findings/vulnerabilities/issues 的对象。
+本路是否完成，只以该 JSON 是否成功落盘并通过自检为准：
+1. 必须使用 write 工具创建（或覆盖）\`${jsonPath}\`，内容为严格合法 JSON。
+2. 写入完成后必须使用 read 工具把该文件读回来做自检：JSON 可解析、结构符合本 prompt 末尾注入的 JSON Schema。
+3. 文件内容必须符合本 prompt 末尾注入的 JSON Schema。
+4. 只有 JSON 成功落盘且自检通过，才算本路子任务完成；**未落盘 = 本路任务未完成**。
+5. 即使没有发现任何漏洞，也必须写入合法的空数组 \`[]\`（或含 \`vulnerabilities: []\` 的对象）。
+6. 最终助手消息里的 JSON **不能替代**磁盘 JSON：即使最终消息给出了符合 schema 的结构化结果，也**不能**因此省略文件落盘。
 
 ${workspaceSearchRules(dir)}
 
@@ -701,7 +708,7 @@ ${workspaceSearchRules(dir)}
 - title/category/description/recommendation/taint_chain 用简体中文。
 - 不要去重、不要代码级验证、不要定级校准、不要搭靶机、不要输出组合利用链。
 
-完成后按 JSON Schema 输出本路发现汇总。vulnerabilities 是高召回原始清单，宁多勿漏。`;
+收尾时按 JSON Schema 输出本路发现汇总（该汇总仅为汇报，不能替代上面的文件落盘）。vulnerabilities 是高召回原始清单，宁多勿漏。`;
 }
 
 /**

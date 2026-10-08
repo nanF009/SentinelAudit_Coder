@@ -195,13 +195,25 @@ export function resolvePiExecutable(): string {
   return 'pi';
 }
 
-export function appendSchemaToPrompt(prompt: string, schemaStr: string): string {
+export function appendSchemaToPrompt(
+  prompt: string,
+  schemaStr: string,
+  opts: { channel?: string } = {}
+): string {
   const schema = String(schemaStr || '').trim();
   if (!schema) return prompt;
+  // subagent 通道：磁盘 JSON 是正式完成产物，禁止用最终助手消息（含 structured）替代落盘。
+  // 其它通道（如 codeverify/verify 等）沿用原文案，行为与措辞均不变。
+  const lead =
+    opts.channel === 'subagent'
+      ? '会话结束前必须输出符合下列 JSON Schema 的最终对象。' +
+        '落盘契约：磁盘 JSON 才是本路的正式完成产物；最终助手消息里的 JSON 不能替代磁盘 JSON——' +
+        '即使最后一条消息已经给出符合该 schema 的 structured JSON，也不能因此省略文件落盘。'
+      : '会话结束前必须输出符合下列 JSON Schema 的最终对象（可同时把结果写入磁盘 JSON；后端也会解析最后一条助手消息）';
   return `${prompt}
 
 # 输出约束
-会话结束前必须输出符合下列 JSON Schema 的最终对象（可同时把结果写入磁盘 JSON；后端也会解析最后一条助手消息）：
+${lead}：
 \`\`\`json
 ${schema}
 \`\`\`
@@ -230,8 +242,12 @@ export function buildAgentCliArgs(opts: {
   template: string;
   prompt: string;
   schemaStr?: string;
+  /** 调用通道（如 'subagent'）。仅用于决定「输出约束」措辞，不参与 argv 构造。 */
+  channel?: string;
 }): { program: string; args: string[]; promptFile?: string; fullPrompt: string } {
-  const fullPrompt = appendSchemaToPrompt(opts.prompt, opts.schemaStr || '');
+  const fullPrompt = appendSchemaToPrompt(opts.prompt, opts.schemaStr || '', {
+    channel: opts.channel,
+  });
   const tokens = opts.template.trim().split(/\s+/).filter(Boolean);
   const args: string[] = [];
   let needsPrompt = false;
