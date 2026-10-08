@@ -85,6 +85,20 @@ export function buildPocText(projectId: string, title: string): string | null {
     '',
   ];
   if (ex.auth_required) lines.push(`所需权限: ${AUTH_LABEL[String(ex.auth_required)] || ex.auth_required}`, '');
+  // 结构化 Finding 字段（与单漏洞 Markdown 报告同序同名）：逐项为空不输出；四项全空不产生任何小节。
+  // 位置固定为「所需权限」之后、「## 验证过程」之前，且不影响下方验证/技术细节/REPRODUCTION/靶机地址与 404 门禁。
+  if (v.root_cause) {
+    lines.push('## 根因', '', v.root_cause, '');
+  }
+  if (v.endpoint) {
+    lines.push('## 入口', '', v.endpoint, '');
+  }
+  if (v.exploitation) {
+    lines.push('## 利用方式', '', v.exploitation, '');
+  }
+  if (v.payload) {
+    lines.push('## Payload', '', '```', v.payload, '```', '');
+  }
   if (ex.local_result) {
     lines.push('## 验证过程', String(ex.local_result), '');
   }

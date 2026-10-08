@@ -342,7 +342,30 @@ export function generateReport(projectId: string): string | null {
       <div class="vuln-meta">
         ${v.category ? `<span>类别：${esc(v.category)}</span>` : ''}
         ${v.file_path ? `<span>位置：${esc(v.file_path)}${v.line ? `:${v.line}` : ''}</span>` : ''}
+        ${/* 验证状态：沿用 exploit 区同一套状态文案（EXPLOIT_STATUS），仅依据持久化的 verified 标记，不改动其含义 */ ''}
+        <span>验证状态：${v.verified ? EXPLOIT_STATUS.success.text : EXPLOIT_STATUS.unknown.text}</span>
+        ${
+          v.auth_required
+            ? `<span>所需权限：${
+                v.auth_required === 'none'
+                  ? '无需登录'
+                  : v.auth_required === 'user'
+                    ? '需登录（普通用户）'
+                    : v.auth_required === 'admin'
+                      ? '需管理员'
+                      : esc(v.auth_required)
+              }${v.auth_reason ? ` — ${esc(v.auth_reason)}` : ''}</span>`
+            : ''
+        }
       </div>
+      ${/* 实战等级：来源 regrade（红队二次评级）。两列皆空则不产生任何节点 */ ''}
+      ${
+        v.regrade_value || v.regrade_reason
+          ? `<div class="vuln-block"><h4>实战等级</h4><p>${
+              v.regrade_value ? esc(v.regrade_value) : ''
+            }${v.regrade_reason ? `${v.regrade_value ? ' — ' : ''}${esc(v.regrade_reason)}` : ''}</p></div>`
+          : ''
+      }
       ${v.description ? `<div class="vuln-block"><h4>问题描述</h4><p>${esc(v.description)}</p></div>` : ''}
       ${
         v.root_cause || v.endpoint || v.exploitation || v.payload
