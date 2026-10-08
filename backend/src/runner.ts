@@ -651,6 +651,22 @@ const insertEventStmt = db.prepare(
 const bufferedEventWrites: PersistedEventPayload[] = [];
 let eventFlushTimer: NodeJS.Timeout | null = null;
 
+// 事件批量写入失败（如 better-sqlite3「This database connection is busy executing a query」，
+// 由 /logs/raw?download=1 的 stmt.iterate() 长时间占用单连接引起）时的有限退避阶梯。
+// 仅用于把「已 splice 摘除但未落库」的批次重新排队，不做零延迟自旋。
+const EVENT_FLUSH_RETRY_DELAYS_MS = [100, 500, 2000];
+let eventFlushRetryAttempt = 0;
+
+/** 按退避阶梯调度下一次重试；阶梯耗尽后不再调度（buffer 继续保留，等新事件自然再触发）。 */
+function scheduleEventFlushRetry(): void {
+  const delay = EVENT_FLUSH_RETRY_DELAYS_MS[eventFlushRetryAttempt];
+  if (delay === undefined) return;
+  eventFlushRetryAttempt += 1;
+  if (eventFlushTimer) return;
+  eventFlushTimer = setTimeout(flushBufferedEvents, delay);
+  eventFlushTimer.unref?.();
+}
+
 function flushBufferedEvents(): void {
   if (eventFlushTimer) {
     clearTimeout(eventFlushTimer);
@@ -658,20 +674,34 @@ function flushBufferedEvents(): void {
   }
   if (bufferedEventWrites.length === 0) return;
   const batch = bufferedEventWrites.splice(0, bufferedEventWrites.length);
-  const tx = db.transaction((events: PersistedEventPayload[]) => {
-    for (const event of events) insertEventStmt.run(event);
-  });
-  tx(batch);
+  try {
+    const tx = db.transaction((events: PersistedEventPayload[]) => {
+      for (const event of events) insertEventStmt.run(event);
+    });
+    tx(batch);
+    // 只有真正落库成功才清零退避阶梯。
+    eventFlushRetryAttempt = 0;
+  } catch (error) {
+    // 先回填、再调度重试：tx 是纯同步 SQLite 调用（仓库内没有任何 db.function 回调），
+    // 期间不可能有新事件入队，故 unshift 等价于「把这批事件按原顺序放回队首」。
+    bufferedEventWrites.unshift(...batch);
+    scheduleEventFlushRetry();
+    // 只记录、不向上抛：本函数既被定时器调用，也被 persistEvent 同步调用，
+    // 抛出会成为 uncaughtException 直接杀掉 runner 进程（本次崩溃即此路径）。
+    console.error('[code] 事件批量写入失败（已回填缓冲，保留待重试）', error);
+  }
 }
 
 function persistEvent(payload: PersistedEventPayload): void {
-  // 状态机依赖 system/error/result 的即时可见性；高频过程事件合并事务写入。
-  if (payload.kind === 'system' || payload.kind === 'error' || payload.kind === 'result') {
+  // 状态机依赖 system/error/result 的即时可见性：改为入队后立刻走同一条批量写入路径落库，
+  // 不再保留任何未受保护的直写入口（连接忙时直写会抛成 uncaughtException）。
+  const immediate =
+    payload.kind === 'system' || payload.kind === 'error' || payload.kind === 'result';
+  bufferedEventWrites.push(payload);
+  if (immediate) {
     flushBufferedEvents();
-    insertEventStmt.run(payload);
     return;
   }
-  bufferedEventWrites.push(payload);
   if (bufferedEventWrites.length >= 64) {
     flushBufferedEvents();
   } else if (!eventFlushTimer) {
