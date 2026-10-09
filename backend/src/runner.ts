@@ -1,4 +1,4 @@
-import { spawn, spawnSync, ChildProcess, execSync, execFile } from 'child_process';
+import { spawn, spawnSync, ChildProcess, execFile } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
 import fs from 'fs';
@@ -49,6 +49,41 @@ import {
 import { deleteProjectRows } from './projectsService';
 import { fetchLatestRelease, localGitVersion } from './githubMeta';
 import { piSpawnEnv, buildAgentCliArgs, cleanupPromptFile } from './piResolver';
+import {
+  createStageGuard,
+  createTerminator,
+  decideAutoRepair,
+  decideSubmit,
+  issueSubmitToken,
+  beginCommit,
+  commitResult,
+  placeholderStageResult,
+  advanceGeneration,
+  forceSettleProject,
+  forceSettleProjectAndWait,
+  activeRunIds,
+  hasBlockingStop,
+  hasLiveStage,
+  blockingStopCount,
+  projectRecoverable,
+  sweepStops,
+  legacyKilledTimedOut,
+  resolveProcessGroupId,
+  judgeStageCompletion,
+  buildPartialCompletionText,
+  isDiagnosticsDirSeparated,
+  AUDIT_PIPELINE_DONE_MARKERS,
+  TERM_GRACE_MS,
+  type GroupOutcomeCounts,
+  type GuardChild,
+  type GuardResult,
+  type ProjectFacts,
+  type StageGuard,
+  type StageOutputBuffer,
+  type Terminator,
+  type StopReason,
+  type StageFacts,
+} from './piStageGuard';
 import { auditGuardSpawnEnv, AUDIT_GUARD_CHANNELS } from './auditPathGuard';
 import { parseJsonArtifact, readJsonArtifactText } from './textEncoding';
 import { pruneRunLogsAsync, checkpointAndReclaim } from './runLogRetention';
@@ -186,6 +221,84 @@ const eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
 eventLoopDelay.enable();
 let resourceRetryTimer: NodeJS.Timeout | null = null;
 
+// —— 阶段生命周期守卫（P0）：进程终止统一走 Terminator（异步、有界、可确认）——
+let terminatorSingleton: Terminator | null = null;
+function getTerminator(): Terminator {
+  if (!terminatorSingleton) terminatorSingleton = createTerminator();
+  return terminatorSingleton;
+}
+/**
+ * 诊断输出目录：超时/异常/非零退出（输出不完整）的阶段性结果写到这里，
+ * 与"正常结果目录"（resDir）物理隔离 —— 下游只扫 resDir，因此不会把
+ * 未完成的输出当作有效漏洞结果或 regrade 输入。
+ * 隔离性由 {@link isDiagnosticsDirSeparated} 显式断言：**部分完成的诊断产物
+ * 绝不允许落进 resDir**（否则"部分完成"会污染正常结果集）。
+ */
+function diagnosticsDirForResults(resDir: string): string {
+  const diagDir = path.join(path.dirname(resDir), 'diagnostics');
+  if (!isDiagnosticsDirSeparated(resDir, diagDir)) {
+    throw new Error(`诊断目录必须与正常结果目录物理隔离：resDir=${resDir} diagDir=${diagDir}`);
+  }
+  return diagDir;
+}
+function persistDiagnostic(
+  resDir: string,
+  groupNo: number,
+  r: GuardResult,
+  extra?: Record<string, unknown>
+): void {
+  try {
+    const dir = diagnosticsDirForResults(resDir);
+    fs.mkdirSync(dir, { recursive: true });
+    const payload = {
+      group: groupNo,
+      terminal: r.facts.terminal,
+      stopState: r.facts.stopState,
+      outputKind: r.facts.outputKind,
+      exitCode: r.facts.exitCode,
+      exitSignal: r.facts.exitSignal,
+      decision: r.decision,
+      note: r.facts.note,
+      stderrTail: String(r.stderrTail || '').slice(-2000),
+      structured: r.structured ?? null,
+      finalResult: typeof r.finalResult === 'string' ? r.finalResult.slice(-20000) : '',
+      ...(extra || {}),
+    };
+    fs.writeFileSync(path.join(dir, `group-${groupNo}.json`), JSON.stringify(payload, null, 2), 'utf8');
+  } catch {
+    /* 诊断写盘失败不影响主流程 */
+  }
+}
+
+/**
+ * 分组阶段是否"全部预期组都正常完成"。
+ * pool=null 表示该阶段没有分组（例如无可验证项 / 低于跳过阈值）→ 视为完成。
+ */
+function stageFullyComplete(pool: GroupOutcomeCounts | null): boolean {
+  return pool == null ? true : judgeStageCompletion(pool).complete;
+}
+
+/**
+ * 阶段完成事件（B：部分完成的状态语义）。
+ *  - 全部预期组正常完成 → 发权威「✓ …完成」标记（lastAuditPipelineDoneTs / inferResumeAuditStage 的判定依据）；
+ *  - 只要有一组异常/输出不完整/未产出 → 发明确的「⚠ …部分完成」事件，记录正常完成数、
+ *    预期组数以及失败或诊断组数量。
+ *
+ * 部分完成文案与权威标记不构成子串包含（见 piStageGuard.AUDIT_PIPELINE_DONE_MARKERS），
+ * 因此 `lastAuditPipelineDoneTs` 不会把部分完成当成完整阶段结束。
+ */
+function recordStageCompletion(
+  projectId: string,
+  label: string,
+  authoritativeText: string,
+  pool: GroupOutcomeCounts | null
+): void {
+  const text = stageFullyComplete(pool)
+    ? authoritativeText
+    : buildPartialCompletionText(label, pool as GroupOutcomeCounts);
+  recordEvent(projectId, { kind: 'system', agent: '主控', tool: '', text }, true, 'audit');
+}
+
 function adaptiveConcurrency(configured: number): number {
   const reserved = getSetting('protect_web_resources') !== '0';
   const guarded = reserved ? Math.min(configured, 3) : configured;
@@ -265,6 +378,16 @@ export function haltAllPiJobs(): { paused: number; killed: number } {
     envRunning.delete(id);
     killed++;
   }
+  // 补漏：multi 通道（codeverify / remoteverify / subagent）的子进程登记在 verifyProcs，
+  // 原实现只遍历 running / envRunning，停摆时这些子进程会被漏杀。
+  for (const [id, set] of [...verifyProcs.entries()]) {
+    verifyKilled.add(id);
+    for (const child of set) {
+      killTree(child);
+      killed++;
+    }
+    set.clear();
+  }
   if (ids.size > 0 || killed > 0) {
     console.log(
       `[code] 已停摆 Pi 任务：暂停 ${ids.size} 个项目，强制结束 ${killed} 个进程`
@@ -303,12 +426,13 @@ export function bulkScheduleResume(ids: string[]): {
 function requestCancel(projectId: string): void {
   cancelledProjects.add(projectId);
 }
-/** 该项目是否仍有任务在途（异步未结束）。 */
+/** 该项目是否仍有任务在途（异步未结束）。未确认停止的旧进程同样视为在途，阻断新流水线。 */
 function isBusy(projectId: string): boolean {
   return (
     activeAuditProjects.has(projectId) ||
     activeVerifyProjects.has(projectId) ||
-    inFlight.has(projectId)
+    inFlight.has(projectId) ||
+    hasBlockingStop(projectId)
   );
 }
 
@@ -1164,49 +1288,25 @@ function clearVerifyResults(projectId: string): void {
   }
 }
 
+/**
+ * 终止子进程树（异步、有界、不阻塞事件循环）。
+ *
+ * 保留旧签名以兼容既有调用点；实际终止改走 StageTerminator：
+ *  - Linux（detached ⇒ 独立进程组）：SIGTERM → TERM_GRACE_MS → SIGKILL；
+ *  - Windows：异步 taskkill /T（带超时），绝不同步等待，也不以退出码宣称整树已停。
+ *
+ * 注意：本函数是"发起终止"，不负责确认停止；需要确认处请用 guard / waitStopped。
+ */
 function killTree(child: ChildProcess): void {
-  if (!child.pid) return;
-  const pid = child.pid;
-  if (process.platform === 'win32') {
-    try {
-      execSync(`taskkill /pid ${pid} /T /F`, { stdio: 'ignore' });
-    } catch {
-      /* ignore */
-    }
-    return;
-  }
-  try {
-    process.kill(-pid, 'SIGTERM');
-  } catch {
-    /* 非进程组 leader 时忽略 */
-  }
-  try {
-    execSync(`pkill -TERM -P ${pid}`, { stdio: 'ignore' });
-  } catch {
-    /* 无子进程 */
-  }
-  try {
-    child.kill('SIGTERM');
-  } catch {
-    /* ignore */
-  }
-  setTimeout(() => {
-    try {
-      process.kill(-pid, 'SIGKILL');
-    } catch {
-      /* ignore */
-    }
-    try {
-      execSync(`pkill -KILL -P ${pid}`, { stdio: 'ignore' });
-    } catch {
-      /* ignore */
-    }
-    try {
-      child.kill('SIGKILL');
-    } catch {
-      /* ignore */
-    }
-  }, 1500);
+  const pid = typeof child.pid === 'number' && child.pid > 0 ? child.pid : null;
+  if (pid == null) return;
+  const term = getTerminator();
+  // 只有确认该子进程是进程组组长时才用 PGID，否则退化为直接子进程。
+  const pgid = resolveProcessGroupId(pid);
+  const guardChild = child as unknown as GuardChild;
+  term.request(guardChild, pgid);
+  const timer = setTimeout(() => term.escalate(guardChild, pgid), TERM_GRACE_MS);
+  timer.unref?.();
 }
 
 interface StageResult {
@@ -1218,15 +1318,29 @@ interface StageResult {
   stderrTail: string;
 }
 
-/** 主通道（非并发验证）Pi Agent 阶段的 resolve 钩子：僵尸看门狗可强制唤醒卡死的 await。 */
-const mainStageResolvers = new Map<string, (result: StageResult) => void>();
-
+/**
+ * 该项目是否仍有 Pi 子进程存活。
+ *
+ * 修复：原实现只读 `running`，而 multi 通道（codeverify / remoteverify / subagent）的子进程
+ * 登记在 `verifyProcs`，导致回收器把**活着**的并发验证阶段误判为僵尸并强制摘槽。
+ * 同时补上 `envRunning` 与 guard 运行登记，并弃用不可靠的 `child.killed` 标志。
+ */
 function isPiChildAlive(projectId: string): boolean {
-  const child = running.get(projectId);
-  if (!child) return false;
-  if (child.killed) return false;
-  if (child.exitCode !== null && child.exitCode !== undefined) return false;
-  return true;
+  const alive = (c: ChildProcess | undefined): boolean => {
+    if (!c) return false;
+    if (typeof c.pid !== 'number' || c.pid <= 0) return false;
+    if (c.signalCode) return false;
+    return c.exitCode === null || c.exitCode === undefined;
+  };
+  if (alive(running.get(projectId))) return true;
+  if (alive(envRunning.get(projectId))) return true;
+  const set = verifyProcs.get(projectId);
+  if (set) {
+    for (const c of set) {
+      if (alive(c)) return true;
+    }
+  }
+  return hasLiveStage(projectId);
 }
 
 /** 审计卡死阈值：Pi Agent 已退出且超过 N 分钟无事件 → 视为僵尸占槽。 */
@@ -1279,21 +1393,16 @@ export function reconcileStalledAuditJobs(): number {
 
     cancelledProjects.add(projectId);
     intentionallyStopped.add(projectId);
-    const forceResolve = mainStageResolvers.get(projectId);
-    if (forceResolve) {
-      mainStageResolvers.delete(projectId);
-      try {
-        forceResolve({
-          killed: true,
-          timedOut: true,
-          code: -1,
-          structured: null,
-          finalResult: '',
-          stderrTail: '审计卡死看门狗：Pi Agent 已退出但阶段未收尾',
-        });
-      } catch {
-        /* ignore */
-      }
+    // 强制结算该项目下**全部通道**的未结算实例（原实现只对 main 通道的 resolver 生效，
+    // 因此 multi（codeverify/remoteverify/subagent）卡死时 Promise 永不结算）。
+    const forced = forceSettleProject(projectId, 'reaper');
+    if (forced > 0) {
+      recordEvent(projectId, {
+        kind: 'system',
+        agent: '主控',
+        tool: '',
+        text: `⚠ 已强制结算 ${forced} 个未收尾的 Pi 阶段实例`,
+      });
     }
     const child = running.get(projectId);
     if (child) {
@@ -1303,6 +1412,20 @@ export function reconcileStalledAuditJobs(): number {
         /* ignore */
       }
       running.delete(projectId);
+    }
+    // 同项目其余通道的子进程也要终止（multi 登记在 verifyProcs，env 登记在 envRunning）。
+    try {
+      stopVerifyProcs(projectId);
+    } catch {
+      /* ignore */
+    }
+    const envChild = envRunning.get(projectId);
+    if (envChild) {
+      try {
+        killTree(envChild);
+      } catch {
+        /* ignore */
+      }
     }
 
     // 强制摘槽 + 清 inFlight，避免原 Promise 永不结束导致排队饿死。
@@ -1320,13 +1443,37 @@ export function reconcileStalledAuditJobs(): number {
       finished_at: now(),
       error_message: `审计卡死自动暂停（空闲 ${idleMin} 分钟）`,
     });
-    // 延后入队：等强制 resolve 的 microtask / 原 runJob.finally 先跑完，避免 isBusy 挡续跑。
+    // 延后入队：等强制结算的 microtask / 原 runJob.finally 先跑完，避免 isBusy 挡续跑。
+    // 自动恢复必须同时满足「进程安全」与「业务可恢复」——不能只凭已摘槽就拉起另一条流水线。
     if (hasArtifacts && isPiJobsEnabled()) {
       const resumeId = projectId;
       setTimeout(() => {
         const cur = getProject(resumeId);
-        if (!cur || (cur.status !== 'paused' && cur.status !== 'queued' && cur.status !== 'failed')) return;
-        if (isBusy(resumeId)) return;
+        if (!cur) return;
+        const resumableStatus =
+          cur.status === 'paused' || cur.status === 'queued' || cur.status === 'failed';
+        const recoverable = projectRecoverable({
+          projectId: resumeId,
+          status: 'paused',
+          verifyStatus: (cur.verify_status || 'none') as ProjectFacts['verifyStatus'],
+          autoRepairCandidate: true,
+          // 回收器本就希望复用当前产物续跑，故不存在"产物已变化"的语义。
+          artifactsChangedSince: false,
+          restartPending: restartRequests.has(resumeId),
+        });
+        const processSafe =
+          !isBusy(resumeId) && !hasBlockingStop(resumeId) && !isPiChildAlive(resumeId);
+        if (!resumableStatus || !recoverable || !processSafe) {
+          if (hasBlockingStop(resumeId)) {
+            recordEvent(resumeId, {
+              kind: 'error',
+              agent: '主控',
+              tool: '',
+              text: '⚠ 上一轮进程停止未确认，已暂不自动续跑（保持阻断，待确认后重试）',
+            });
+          }
+          return;
+        }
         enqueueReprocess(resumeId, false, true);
       }, 250);
     }
@@ -1345,6 +1492,20 @@ export function startAuditStallWatchdog(): void {
     } catch (e) {
       console.error('[code] 审计卡死看门狗失败', e);
     }
+    // 复查未确认停止的旧进程（blockingStops / residualRisks）。复用本 tick，不新增定时器。
+    void sweepStops({
+      onEvent: (id, kind, text) => {
+        try {
+          recordEvent(id, { kind, agent: '主控', tool: '', text });
+        } catch {
+          /* ignore */
+        }
+      },
+    })
+      .then((res) => {
+        if (res.cleared > 0 || res.downgraded > 0) scheduleStartNext();
+      })
+      .catch((e) => console.error('[code] 停止记录复查失败', e));
   };
   const kickoff = setTimeout(tick, 60_000);
   kickoff.unref?.();
@@ -1362,8 +1523,10 @@ function runPiStage(
     phase?: EventPhase;
     hardMsOverride?: number;
     idleMsOverride?: number;
+    /** 输出完整性判定（可选）；缺省为"仅结构化输出算完整"。 */
+    parseComplete?: (structured: any, finalResult: string) => boolean;
   } = {}
-): Promise<StageResult> {
+): Promise<GuardResult> {
   const channel = opts.channel ?? 'main';
   const phase = opts.phase ?? 'audit';
   const multi = channel === 'codeverify' || channel === 'remoteverify' || channel === 'subagent';
@@ -1374,40 +1537,53 @@ function runPiStage(
     'meta',
     JSON.stringify({ event: 'stage_requested', codeDir, phase, channel, run_id: runLog.runId })
   );
+  // 超时预算（不依赖子进程，故提前计算以便交给 guard）。
+  const hardMs = opts.hardMsOverride && opts.hardMsOverride > 0 ? opts.hardMsOverride : stageTimeoutMs();
+  const idleMs = opts.idleMsOverride && opts.idleMsOverride > 0 ? opts.idleMsOverride : idleTimeoutMs();
+  const settleMs = settleAfterOutputMs();
+  // 阶段输出缓冲（结构化结果 / 最终文本 / stderr 尾巴），由 guard 在结算时读取。
+  const output: StageOutputBuffer = { structured: null, finalResult: '', stderrTail: '' };
+
   return new Promise((resolve) => {
-    let settled = false;
     let promptFileToClean: string | undefined;
-    const settle = (result: StageResult) => {
-      if (settled) return;
-      settled = true;
-      cleanupPromptFile(promptFileToClean);
-      if (!multi && mainStageResolvers.get(projectId) === settle) {
-        mainStageResolvers.delete(projectId);
-      }
-      resolve(result);
+    // 每个阶段实例拥有独立状态、定时器与监听器（见 piStageGuard）。
+    const guard: StageGuard = createStageGuard({
+      projectId,
+      runId: runLog.runId,
+      channel,
+      terminator: getTerminator(),
+      hardMs,
+      idleMs,
+      settleMs,
+      // runPiStage 自身只做保守判定：仅"拿到了结构化输出"才算完整；
+      // 各核验层（去重/代码级验证/二次评级）另有更精确的完整性判定。
+      parseComplete: opts.parseComplete ?? ((structured: any) => structured != null),
+      onEvent: (kind, text) => recordEvent(projectId, { kind, agent: '主控', tool: '', text }, true, phase),
+      isCancelled: () => cancelledProjects.has(projectId) || stoppedSet.has(projectId),
+      getOutput: () => output,
+    });
+    // guard 结算即代表本阶段结束：清理临时 prompt 文件后 resolve（保持既有 Promise 语义）。
+    const finish = (): void => {
+      void guard.done.then((r) => {
+        cleanupPromptFile(promptFileToClean);
+        // 与旧实现一致：超时时把原因放进 stderrTail，便于调用方直接展示。
+        if (r.timedOut && !r.stderrTail && r.facts.note) r.stderrTail = r.facts.note;
+        resolve(r);
+      });
     };
-    // 仅主审计通道注册：看门狗可在 Pi Agent 已退出但 Promise 未 settle 时强制唤醒。
-    if (!multi && channel === 'main') {
-      mainStageResolvers.set(projectId, settle);
-    }
 
     // 协作式取消：项目已被暂停/重跑/删除请求中止 → 不再 spawn 新 Pi，直接判 killed 收尾，
     // 杜绝"被取代/已暂停的旧异步仍在逐批拉起 Pi"的空转。（env 通道由 stopEnvChannel 单独管控，不在此拦截。）
     if (channel !== 'env' && cancelledProjects.has(projectId)) {
       runLog.append('meta', JSON.stringify({ event: 'stage_skipped', reason: 'cancelled' }));
-      settle({ killed: true, timedOut: false, code: -1, structured: null, finalResult: '', stderrTail: '已请求中止，跳过本阶段' });
+      guard.skipBeforeSpawn('cancelled', '已请求中止，跳过本阶段');
+      finish();
       return;
     }
     if (!isPiJobsEnabled()) {
       runLog.append('meta', JSON.stringify({ event: 'stage_skipped', reason: 'jobs_disabled' }));
-      settle({
-        killed: true,
-        timedOut: false,
-        code: -1,
-        structured: null,
-        finalResult: '',
-        stderrTail: 'Pi 任务已停摆，跳过本阶段',
-      });
+      guard.skipBeforeSpawn('cancelled', 'Pi 任务已停摆，跳过本阶段');
+      finish();
       return;
     }
     // ② 省 token · 验证环节模型分级：代码验证层（去重/代码级验证/二次评级，channel==='codeverify'）
@@ -1452,18 +1628,15 @@ function runPiStage(
         cwd: codeDir,
         env: { ...piSpawnEnv(), ...spawnEnvExtra },
         windowsHide: true,
+        // Linux：detached 让子进程成为独立进程组组长，从而可用 process.kill(-pgid)
+        // 权威判定/终止整棵进程树（含 Pi 的工具子进程与 docker compose build）。
+        detached: process.platform !== 'win32',
       });
     } catch (err: any) {
       cleanupPromptFile(promptFile);
       runLog.append('meta', JSON.stringify({ event: 'spawn_error', error: String(err?.message || err) }));
-      settle({
-        killed: false,
-        timedOut: false,
-        code: -1,
-        structured: null,
-        finalResult: '',
-        stderrTail: `无法启动 Pi：${err?.message || err}`,
-      });
+      guard.markSpawnFailed(`无法启动 Pi：${err?.message || err}`);
+      finish();
       return;
     }
 
@@ -1483,57 +1656,33 @@ function runPiStage(
     if (child.stdin) child.stdin.end();
 
     let buffer = '';
-    let finalResult = '';
-    let structured: any = null;
-    let stderrTail = '';
     const subagentByToolId = new Map<string, string>();
     const seenAgents = new Set<string>();
 
-    // —— 超时看门狗：检测卡死进程并自动终止，避免永久占用并发槽 ——
-    const startedAt = Date.now();
-    let lastOutputAt = Date.now();
-    let timedOut = false;
-    let timeoutReason = '';
-    const hardMs = opts.hardMsOverride && opts.hardMsOverride > 0 ? opts.hardMsOverride : stageTimeoutMs();
-    const idleMs = opts.idleMsOverride && opts.idleMsOverride > 0 ? opts.idleMsOverride : idleTimeoutMs();
-    // 结果收尾宽限：仅在 Pi 发出 agent_end（或旧引擎 type:'result'）后才启用——
-    // 若进程随后迟迟不退出（卡死），静默 settleMs 后主动收尾。
-    // 关键：绝不依据中途的结构化片段来收尾，否则会误杀仍在工作的审计。
-    const settleMs = settleAfterOutputMs();
-    let settleTimer: NodeJS.Timeout | null = null;
-    let resultSeen = false;
-    const resetSettleTimer = () => {
-      if (settleMs <= 0 || !resultSeen) return;
-      if (settleTimer) clearTimeout(settleTimer);
-      settleTimer = setTimeout(() => {
-        recordEvent(
-          projectId,
-          {
-            kind: 'system',
-            agent: '主控',
-            tool: '',
-            text: '✓ 会话已结束但进程未自行退出，主动收尾并保存结果以释放资源',
-          },
-          true,
-          phase
-        );
-        killTree(child);
-      }, settleMs);
-    };
-    const watchdog = setInterval(() => {
-      const t = Date.now();
-      if (hardMs > 0 && t - startedAt > hardMs) {
-        timeoutReason = `运行超过 ${Math.round(hardMs / 60000)} 分钟硬上限，已自动终止`;
-      } else if (idleMs > 0 && t - lastOutputAt > idleMs) {
-        timeoutReason = `连续 ${Math.round(idleMs / 60000)} 分钟无任何输出（疑似卡死），已自动终止`;
-      }
-      if (timeoutReason) {
-        timedOut = true;
-        clearInterval(watchdog);
-        recordEvent(projectId, { kind: 'error', agent: '主控', tool: '', text: `⏱ ${timeoutReason}` }, true, phase);
-        killTree(child);
-      }
-    }, 30_000);
+    // 交由 guard 接管阶段生命周期：注册 guard 自己的 close/error 监听器，
+    // 并启动硬超时 / 空闲超时 / 收尾宽限计时器。所有结算路径幂等。
+    guard.markSpawned(child as unknown as GuardChild, {
+      onClose: (code, signal) => {
+        try {
+          // 同步抽干剩余 stdout，避免 setImmediate drain 未跑完就结算丢终态。
+          drainStdoutLines(Number.POSITIVE_INFINITY);
+          if (buffer.trim()) processStdoutLine(buffer.trim());
+          buffer = '';
+          runLog.append('meta', JSON.stringify({ event: 'process_close', code, signal }));
+          runLog.flush();
+        } catch {
+          /* flush 异常也不能阻止结算，否则调用方永久 await → 僵尸占槽。 */
+        }
+      },
+      onError: (err) => {
+        try {
+          runLog.append('meta', JSON.stringify({ event: 'process_error', error: err.message }));
+          runLog.flush();
+        } catch {
+          /* ignore */
+        }
+      },
+    });
 
     child.stdout?.setEncoding('utf8');
     // 单行 stream-json 超过该长度时跳过 JSON.parse：巨型 StructuredOutput 解析会冻事件循环数秒。
@@ -1543,14 +1692,13 @@ function runPiStage(
     const processStdoutLine = (line: string): void => {
       if (!line) return;
       const markSessionEnd = () => {
-        resultSeen = true;
-        resetSettleTimer();
+        guard.noteSessionEnd();
       };
       const ingestAssistantText = (text: string) => {
         if (!text) return;
-        finalResult = text;
+        output.finalResult = text;
         const parsed = tryExtractStructured(text);
-        if (parsed) structured = parsed;
+        if (parsed) output.structured = parsed;
       };
       // 超大行：跳过 JSON.parse（会冻事件循环），仍用廉价检查抓会话结束信号。
       if (line.length > MAX_JSON_LINE) {
@@ -1612,7 +1760,7 @@ function runPiStage(
               typeof part.input.has_web === 'boolean' ||
               typeof part.input.has_registration === 'boolean')
           ) {
-            structured = part.input;
+            output.structured = part.input;
           }
         }
       }
@@ -1646,8 +1794,7 @@ function runPiStage(
     };
     child.stdout?.on('data', (chunk: string) => {
       runLog.append('stdout', chunk);
-      lastOutputAt = Date.now();
-      if (resultSeen) resetSettleTimer();
+      guard.noteStdout();
       buffer += chunk;
       if (buffer.length > 8 * 1024 * 1024) {
         buffer = buffer.slice(-1 * 1024 * 1024);
@@ -1661,67 +1808,20 @@ function runPiStage(
     child.stderr?.setEncoding('utf8');
     child.stderr?.on('data', (chunk: string) => {
       runLog.append('stderr', chunk);
-      lastOutputAt = Date.now();
-      stderrTail = (stderrTail + chunk).slice(-2000);
+      // stderr 只作诊断，不刷新 idle —— 避免"只说话不出活"压住卡死检测。
+      guard.noteStderr();
+      output.stderrTail = (output.stderrTail + chunk).slice(-2000);
     });
 
-    child.on('error', (err) => {
-      try {
-        runLog.append('meta', JSON.stringify({ event: 'process_error', error: err.message }));
-        runLog.flush();
-      } finally {
-        clearInterval(watchdog);
-        if (settleTimer) clearTimeout(settleTimer);
-        if (multi) verifyProcs.get(projectId)?.delete(child);
-        const killed = multi ? verifyKilled.has(projectId) : stoppedSet.has(projectId);
-        settle({
-          killed,
-          timedOut,
-          code: -1,
-          structured,
-          finalResult,
-          stderrTail: timedOut ? timeoutReason : stderrTail || err.message,
-        });
+    // 子进程事件已由 guard 接管（见 markSpawned 的 hooks），此处只等待结算。
+    finish();
+    void guard.done.then((r) => {
+      if (multi) {
+        verifyProcs.get(projectId)?.delete(child);
+        return;
       }
-    });
-    child.on('close', (code) => {
-      try {
-        // 同步抽干剩余 stdout，避免 setImmediate drain 未跑完就 settle 丢终态。
-        drainStdoutLines(Number.POSITIVE_INFINITY);
-        if (buffer.trim()) processStdoutLine(buffer.trim());
-        buffer = '';
-        runLog.append(
-          'meta',
-          JSON.stringify({ event: 'process_close', code, timed_out: timedOut, timeout_reason: timeoutReason })
-        );
-        runLog.flush();
-      } finally {
-        // flush 异常也不能阻止 Promise settle，否则 doAudit 永久 await → 僵尸 running 占槽。
-        clearInterval(watchdog);
-        if (settleTimer) clearTimeout(settleTimer);
-        if (multi) {
-          verifyProcs.get(projectId)?.delete(child);
-          settle({
-            killed: verifyKilled.has(projectId),
-            timedOut,
-            code,
-            structured,
-            finalResult,
-            stderrTail: timedOut ? timeoutReason : stderrTail,
-          });
-          return;
-        }
-        const killed = stoppedSet.has(projectId);
-        if (killed) stoppedSet.delete(projectId);
-        settle({
-          killed,
-          timedOut,
-          code,
-          structured,
-          finalResult,
-          stderrTail: timedOut ? timeoutReason : stderrTail,
-        });
-      }
+      // 与旧实现一致：被"有意停止"标记后，本阶段结算时清掉该标记，避免永久粘滞。
+      if (r.killed && stoppedSet.has(projectId)) stoppedSet.delete(projectId);
     });
   });
 }
@@ -2008,11 +2108,20 @@ type GroupedPiWorkerOpts<T> = {
   progressTotal: number;
   countFile: (p: string) => number;
   persist: (outFile: string, r: { structured: any; finalResult: string }) => void;
+  /** 该阶段"输出完整"的判定：决定能否作为正常结果提交（缺省则一律视为不完整）。 */
+  parseComplete: (structured: any, finalResult: string) => boolean;
   prompt: (groupFile: string, outFile: string, group: T[], groupNo: number, groupTotal: number) => string;
 };
 
+/** 分组阶段运行结果：findings + 中止标记 + 组级完成度（pool=null 表示该阶段无分组）。 */
+interface StageRunResult {
+  findings: any[];
+  killed: boolean;
+  pool: GroupOutcomeCounts | null;
+}
+
 /** 核验层工人池：去重 / 代码级验证 / 二次评级共用。 */
-async function runGroupedPiWorkers<T>(opts: GroupedPiWorkerOpts<T>): Promise<{ killed: boolean }> {
+async function runGroupedPiWorkers<T>(opts: GroupedPiWorkerOpts<T>): Promise<GroupOutcomeCounts> {
   const {
     projectId,
     codeDir,
@@ -2027,6 +2136,7 @@ async function runGroupedPiWorkers<T>(opts: GroupedPiWorkerOpts<T>): Promise<{ k
     progressTotal,
     countFile,
     persist,
+    parseComplete,
     prompt,
   } = opts;
   fs.mkdirSync(groupsDir, { recursive: true });
@@ -2056,8 +2166,14 @@ async function runGroupedPiWorkers<T>(opts: GroupedPiWorkerOpts<T>): Promise<{ k
   const groupIdleMs = 10 * 60_000;
   let cursor = 0;
   let killed = false;
+  let aborted = false;
+  // 组级完成度：正常提交 / 仅诊断 / 未产出。阶段"完整完成"的唯一判据见 judgeStageCompletion。
+  let committed = 0;
+  let diagnosed = 0;
+  let discarded = 0;
   const worker = async () => {
     while (true) {
+      if (aborted) return;
       if (cancelledProjects.has(projectId) || verifyKilled.has(projectId)) {
         killed = true;
         return;
@@ -2085,9 +2201,51 @@ async function runGroupedPiWorkers<T>(opts: GroupedPiWorkerOpts<T>): Promise<{ k
           phase: 'audit',
           hardMsOverride: Math.min(45 * 60_000, Math.max(12 * 60_000, group.length * 90_000)),
           idleMsOverride: groupIdleMs,
+          parseComplete,
         }
       );
-      persist(outFile, r);
+      // —— 结果提交：区分「有输出」与「输出可进入下游」——
+      // 超时 / 异常 / 停止未确认的输出只落诊断目录；诊断目录不在 resDir 内，
+      // 因此下游聚合（去重 / 代码级验证 / 二次评级 / regrade 输入）天然读不到。
+      // 提交令牌确保被取代/失效的旧实例无法覆盖新结果。
+      const token = issueSubmitToken(projectId, r.runId);
+      const sub = decideSubmit(r.facts);
+      if (sub.action === 'commit') {
+        const written = commitResult(token, () => {
+          persist(outFile, r);
+          return true;
+        });
+        if (written) committed += 1;
+        else discarded += 1;
+      } else if (sub.action === 'diagnose') {
+        const written = commitResult(token, () => {
+          persistDiagnostic(resDir, groupNo, r, { submitReason: sub.reason });
+          recordEvent(projectId, {
+            kind: 'system',
+            agent: '主控',
+            tool: '',
+            text: `⚠ 第 ${groupNo} 组未产出可采信结果（${sub.reason}），输出仅留存诊断`,
+          });
+          return true;
+        });
+        if (written) diagnosed += 1;
+        else discarded += 1;
+      } else {
+        // discard（启动失败/取消）：不写盘，也不额外记事件 ——
+        // 启动失败已由守卫在结算时产出唯一一条明确错误事件（避免同一失败被记两次）。
+        discarded += 1;
+      }
+      // 停止未确认（alive/unknown）：禁止推进到下一组，避免新旧流水线并行/残留进程互撞。
+      if (!r.decision.proceed) {
+        aborted = true;
+        recordEvent(projectId, {
+          kind: 'error',
+          agent: '主控',
+          tool: '',
+          text: `⚠ 第 ${groupNo} 组停止未确认（stopState=${r.facts.stopState}，${r.decision.reason}），已中止本阶段`,
+        });
+        return;
+      }
       if (r.killed) {
         killed = true;
         return;
@@ -2101,7 +2259,14 @@ async function runGroupedPiWorkers<T>(opts: GroupedPiWorkerOpts<T>): Promise<{ k
     polledDone = true;
     clearInterval(poll);
   }
-  return { killed: killed || verifyKilled.has(projectId) };
+  return {
+    killed: killed || verifyKilled.has(projectId),
+    aborted,
+    groupsTotal: groups.length,
+    committed,
+    diagnosed,
+    discarded,
+  };
 }
 
 /**
@@ -2113,8 +2278,9 @@ async function regradeFindings(
   projectId: string,
   codeDir: string,
   findings: any[]
-): Promise<{ findings: any[]; killed: boolean }> {
-  if (!isAiRegrade(projectId) || findings.length === 0) return { findings, killed: false };
+): Promise<StageRunResult> {
+  if (!isAiRegrade(projectId) || findings.length === 0)
+    return { findings, killed: false, pool: null };
   verifyKilled.delete(projectId);
 
   const batchSize = regradeBatchSize();
@@ -2165,7 +2331,7 @@ async function regradeFindings(
     }
   };
 
-  const pool = await runGroupedPiWorkers({
+  const outcome = await runGroupedPiWorkers({
     projectId,
     codeDir,
     groups,
@@ -2180,10 +2346,12 @@ async function regradeFindings(
     progressTotal: findings.length,
     countFile: (p) => readRegradeFile(p).length,
     persist: persistGroup,
+    parseComplete: (s: any, t: string) =>
+      (s != null && Array.isArray(s.ratings)) || parseRatings(t).length > 0,
     prompt: (groupFile, outFile, group, groupNo, groupTotal) =>
       buildRegradeWorkerPrompt(codeDir, groupFile, outFile, group.length, groupNo, groupTotal),
   });
-  if (pool.killed) return { findings, killed: true };
+  if (outcome.killed || outcome.aborted) return { findings, killed: true, pool: outcome };
 
   const ratings: any[] = [];
   try {
@@ -2246,13 +2414,14 @@ async function regradeFindings(
     ...v,
     regrade_value: realTeamLabel(v.severity),
   }));
-  recordEvent(projectId, {
-    kind: 'system',
-    agent: '主控',
-    tool: '',
-    text: `✓ 实战二次评级完成：${graded}/${findings.length} 个漏洞已评级，其中 ${changed} 个等级被调整`,
-  });
-  return { findings: finalFindings, killed: false };
+  // B：只有全部预期组都正常完成才发权威「✓ 实战二次评级完成」（lastAuditPipelineDoneTs 依赖它）。
+  recordStageCompletion(
+    projectId,
+    '实战二次评级',
+    `✓ 实战二次评级完成：${graded}/${findings.length} 个漏洞已评级，其中 ${changed} 个等级被调整`,
+    outcome
+  );
+  return { findings: finalFindings, killed: false, pool: outcome };
 }
 
 
@@ -2310,8 +2479,8 @@ async function aiDedupFindings(
   projectId: string,
   codeDir: string,
   raw: any[]
-): Promise<{ findings: any[]; killed: boolean }> {
-  if (!isAiDedup(projectId) || raw.length < 2) return { findings: raw, killed: false };
+): Promise<StageRunResult> {
+  if (!isAiDedup(projectId) || raw.length < 2) return { findings: raw, killed: false, pool: null };
   // ⑤ 省 token：候选数低于阈值时跳过整个 AI 去重 Pi Agent pass（机械去重已生效）。
   const dedupMin = aiDedupMinCandidates();
   if (dedupMin > 0 && raw.length < dedupMin) {
@@ -2321,7 +2490,7 @@ async function aiDedupFindings(
       tool: '',
       text: `候选 ${raw.length} 条低于 AI 去重阈值 ${dedupMin}，跳过 AI 语义去重（省一轮 fan-out）`,
     });
-    return { findings: raw, killed: false };
+    return { findings: raw, killed: false, pool: null };
   }
   verifyKilled.delete(projectId); // 进入验证类工作，清理上轮可能残留的中止标志
 
@@ -2375,7 +2544,7 @@ async function aiDedupFindings(
   };
 
   const lean = isLeanVerifyPrompt();
-  const pool = await runGroupedPiWorkers({
+  const outcome = await runGroupedPiWorkers({
     projectId,
     codeDir,
     groups: workGroups,
@@ -2390,10 +2559,13 @@ async function aiDedupFindings(
     progressTotal: workGroups.length,
     countFile: () => 1,
     persist: persistGroup,
+    parseComplete: (s: any, t: string) =>
+      (s != null && Array.isArray(s.duplicate_groups)) ||
+      parseStructuredArray(t, 'duplicate_groups').length > 0,
     prompt: (groupFile, outFile, group, groupNo, groupTotal) =>
       buildDedupWorkerPrompt(codeDir, groupFile, outFile, group.length, groupNo, groupTotal, { lean }),
   });
-  if (pool.killed) return { findings: raw, killed: true };
+  if (outcome.killed || outcome.aborted) return { findings: raw, killed: true, pool: outcome };
 
   // 读盘汇总所有重复分组（全局 index）。
   const groups: any[] = [];
@@ -2492,20 +2664,16 @@ async function aiDedupFindings(
 
   const clusterCount = clusterSize.size;
   const faceTotal = [...clusterSize.values()].reduce((a, b) => a + b, 0);
-  recordEvent(
+  // B：只有全部预期组都正常完成才发权威「✓ AI 智能去重完成」（inferResumeAuditStage 依赖它定位续跑环节）。
+  recordStageCompletion(
     projectId,
-    {
-      kind: 'system',
-      agent: '主控',
-      tool: '',
-      text: `✓ AI 智能去重完成：${raw.length} 个候选 → ${result.length} 个（合并纯重复 ${removed.size} 条${
-        clusterCount > 0 ? `；识别 ${clusterCount} 个利用面簇，共 ${faceTotal} 个面各自独立保留` : ''
-      }）`,
-    },
-    true,
-    'audit'
+    'AI 智能去重',
+    `✓ AI 智能去重完成：${raw.length} 个候选 → ${result.length} 个（合并纯重复 ${removed.size} 条${
+      clusterCount > 0 ? `；识别 ${clusterCount} 个利用面簇，共 ${faceTotal} 个面各自独立保留` : ''
+    }）`,
+    outcome
   );
-  return { findings: result, killed: false };
+  return { findings: result, killed: false, pool: outcome };
 }
 
 /**
@@ -2517,8 +2685,8 @@ async function codeVerifyFindings(
   projectId: string,
   codeDir: string,
   raw: any[]
-): Promise<{ findings: any[]; killed: boolean }> {
-  if (raw.length === 0) return { findings: [], killed: false };
+): Promise<StageRunResult> {
+  if (raw.length === 0) return { findings: [], killed: false, pool: null };
   verifyKilled.delete(projectId); // 清理上一轮可能残留的中止标志
 
   // B1：信任技能已验证清单——directly_exploitable_vulns.json 里的漏洞是审计技能内部已做过
@@ -2548,7 +2716,8 @@ async function codeVerifyFindings(
       }
     }
   }
-  if (toVerify.length === 0) return { findings: preVerified, killed: false };
+  if (toVerify.length === 0)
+    return { findings: preVerified, killed: false, pool: null }; // 无待验证项 = 无分组 = 视为完成
 
   const batchSize = regradeBatchSize();
   const merged = isMergeVerifyRegrade();
@@ -2604,7 +2773,7 @@ async function codeVerifyFindings(
     }
   };
 
-  const pool = await runGroupedPiWorkers({
+  const outcome = await runGroupedPiWorkers({
     projectId,
     codeDir,
     groups: workGroups,
@@ -2619,10 +2788,13 @@ async function codeVerifyFindings(
     progressTotal: toVerify.length,
     countFile: (p) => readCodeVerifyFile(p).length,
     persist: persistGroup,
+    parseComplete: (s: any, t: string) =>
+      (s != null && Array.isArray(s.results)) || parseStructuredArray(t, 'results').length > 0,
     prompt: (groupFile, outFile, group, groupNo, groupTotal) =>
       buildCodeVerifyWorkerPrompt(codeDir, groupFile, outFile, group.length, groupNo, groupTotal, { merged, lean }),
   });
-  if (pool.killed) return { findings: preVerified, killed: true };
+  if (outcome.killed || outcome.aborted)
+    return { findings: preVerified, killed: true, pool: outcome };
 
   const readVerdicts = (): Map<string, any> => {
     const map = new Map<string, any>();
@@ -2693,18 +2865,15 @@ async function codeVerifyFindings(
   });
 
   const out = [...preVerified, ...kept];
-  recordEvent(
+  // B：只有**全部预期组都正常完成**才发权威「✓ 代码级验证完成」——
+  // 该事件是 lastAuditPipelineDoneTs 的核心阶段完成判据，绝不能被"部分完成"占用。
+  recordStageCompletion(
     projectId,
-    {
-      kind: 'system',
-      agent: '主控',
-      tool: '',
-      text: `✓ 代码级验证完成：${raw.length} 个候选 → ${out.length} 个真阳性（已剔除误报/设计决策${preVerified.length > 0 ? `，含 ${preVerified.length} 个技能已验证直接留用` : ''}）`,
-    },
-    true,
-    'audit'
+    '代码级验证',
+    `✓ 代码级验证完成：${raw.length} 个候选 → ${out.length} 个真阳性（已剔除误报/设计决策${preVerified.length > 0 ? `，含 ${preVerified.length} 个技能已验证直接留用` : ''}）`,
+    outcome
   );
-  return { findings: out, killed: false };
+  return { findings: out, killed: false, pool: outcome };
 }
 
 /* ----------------- 子智能体覆盖核对：精准补跑漏跑的子智能体（不整轮重跑） ----------------- */
@@ -3520,12 +3689,9 @@ function loadDbVulns(projectId: string): any[] {
 }
 
 /** 环节：AI 智能去重。输入=JSON/原始发现保守去重；输出落盘 deduped.json。 */
-async function stageDedup(
-  projectId: string,
-  codeDir: string
-): Promise<{ findings: any[]; killed: boolean }> {
+async function stageDedup(projectId: string, codeDir: string): Promise<StageRunResult> {
   const raw = loadRawCandidates(codeDir);
-  if (raw.length === 0) return { findings: [], killed: false };
+  if (raw.length === 0) return { findings: [], killed: false, pool: null };
   recordEvent(projectId, {
     kind: 'system',
     agent: '主控',
@@ -3533,9 +3699,9 @@ async function stageDedup(
     text: `读取子智能体原始发现并保守去重后共 ${raw.length} 个候选`,
   });
   const d = await aiDedupFindings(projectId, codeDir, raw);
-  if (d.killed) return { findings: [], killed: true };
+  if (d.killed) return { findings: [], killed: true, pool: d.pool };
   writePipeline(codeDir, 'deduped.json', d.findings);
-  return { findings: d.findings, killed: false };
+  return { findings: d.findings, killed: false, pool: d.pool };
 }
 
 /** 环节：代码级验证。输入优先上游传入，否则读 deduped.json，再回退原始候选；输出落盘 verified.json。 */
@@ -3543,7 +3709,7 @@ async function stageCodeVerify(
   projectId: string,
   codeDir: string,
   inputOverride?: any[]
-): Promise<{ findings: any[]; killed: boolean }> {
+): Promise<StageRunResult> {
   let input = inputOverride ?? readPipeline(codeDir, 'deduped.json');
   if (!input) {
     // 没有去重产物（如直接"从代码级验证开始"）：不能拿去重前的原始候选直接验证，
@@ -3558,12 +3724,12 @@ async function stageCodeVerify(
         text: `未找到去重产物：先对 ${raw.length} 个原始候选补做 AI 智能去重，再进行代码级验证`,
       });
       const d = await aiDedupFindings(projectId, codeDir, raw);
-      if (d.killed) return { findings: [], killed: true };
+      if (d.killed) return { findings: [], killed: true, pool: d.pool };
       writePipeline(codeDir, 'deduped.json', d.findings);
       input = d.findings;
     }
   }
-  if (!input || input.length === 0) return { findings: [], killed: false };
+  if (!input || input.length === 0) return { findings: [], killed: false, pool: null };
   recordEvent(projectId, {
     kind: 'system',
     agent: '主控',
@@ -3571,10 +3737,10 @@ async function stageCodeVerify(
     text: `去重后共 ${input.length} 个候选，开始逐条代码级验证`,
   });
   const v = await codeVerifyFindings(projectId, codeDir, input);
-  if (v.killed) return { findings: [], killed: true };
+  if (v.killed) return { findings: [], killed: true, pool: v.pool };
   const findings = dropCombinationChains(v.findings);
   writePipeline(codeDir, 'verified.json', findings);
-  return { findings, killed: false };
+  return { findings, killed: false, pool: v.pool };
 }
 
 /**
@@ -3588,7 +3754,7 @@ async function stageRegrade(
   projectId: string,
   codeDir: string,
   inputOverride?: any[]
-): Promise<{ findings: any[]; killed: boolean }> {
+): Promise<StageRunResult> {
   let input =
     inputOverride ?? readPipeline(codeDir, 'verified.json') ?? readPipeline(codeDir, 'deduped.json');
   // 空数组也要回退：代码级验证可能写出 verified.json=[]，不能挡住入库漏洞的二次评级
@@ -3612,14 +3778,14 @@ async function stageRegrade(
       tool: '',
       text: '二次评级缺少上游产物：未找到已验证漏洞，也没有入库漏洞。请先执行「代码级验证」或完整审计后再单独重跑二次评级。',
     });
-    return { findings: loadDbVulns(projectId), killed: false };
+    return { findings: loadDbVulns(projectId), killed: false, pool: null };
   }
   const g = await regradeFindings(projectId, codeDir, input);
-  if (g.killed) return { findings: [], killed: true };
+  if (g.killed) return { findings: [], killed: true, pool: g.pool };
   // 二次评级是"对同一批漏洞整集重算等级"：先清空旧漏洞再写回（数量与输入一致），杜绝重复累加。
   db.prepare('DELETE FROM vulnerabilities WHERE project_id = ?').run(projectId);
   saveVulnerabilities(projectId, g.findings);
-  return { findings: g.findings, killed: false };
+  return { findings: g.findings, killed: false, pool: g.pool };
 }
 
 /**
@@ -3643,6 +3809,8 @@ async function processFindings(
   ]);
 
   let findings: any[];
+  // 代码级验证的组级完成度：合并评级模式下用它门禁「已合并二次评级」权威标记。
+  let verifyPool: GroupOutcomeCounts | null = null;
   if (raw.length > 0) {
     recordEvent(projectId, {
       kind: 'system',
@@ -3663,6 +3831,7 @@ async function processFindings(
     });
     const verified = await codeVerifyFindings(projectId, codeDir, deduped.findings);
     if (verified.killed) return; // 验证阶段被暂停/删除：不落库
+    verifyPool = verified.pool;
     findings = dropCombinationChains(verified.findings); // 保持"单漏洞"口径，剔除组合链
     writePipeline(codeDir, 'verified.json', findings);
   } else {
@@ -3687,12 +3856,12 @@ async function processFindings(
       ...v,
       regrade_value: realTeamLabel(String(v.severity || 'info').toLowerCase()),
     }));
-    recordEvent(projectId, {
-      kind: 'system',
-      agent: '主控',
-      tool: '',
-      text: '✓ 已合并二次评级到代码级验证（省一轮评级 fan-out），直接落库',
-    });
+    recordStageCompletion(
+      projectId,
+      '代码级验证（含二次评级）',
+      '✓ 已合并二次评级到代码级验证（省一轮评级 fan-out），直接落库',
+      verifyPool
+    );
     saveVulnerabilities(projectId, finalFindings);
     finishAudit(projectId, 'completed', null);
     return;
@@ -7065,14 +7234,9 @@ async function runRemoteVerifyCore(
   // 主控要跑完全部漏洞 + 组合链 + 历史版本，耗时远超单批，故放宽硬/空闲超时上限。
   const masterHardMs = Math.max(stageTimeoutMs(), 6 * 60 * 60_000);
   const masterIdleMs = Math.max(idleTimeoutMs(), 40 * 60_000);
-  let r: Awaited<ReturnType<typeof runPiStage>> = {
-    killed: false,
-    structured: undefined,
-    finalResult: '',
-    code: 0,
-    stderrTail: '',
-    timedOut: false,
-  };
+  let r: Awaited<ReturnType<typeof runPiStage>> = placeholderStageResult({
+    channel: 'remoteverify',
+  });
   if (!chainOnly && vulns.length > 0) {
     try {
       r = await withVerifyGate(() =>
@@ -7513,14 +7677,9 @@ async function runHarnessVerifyCore(
 
   const masterHardMs = Math.max(stageTimeoutMs(), 6 * 60 * 60_000);
   const masterIdleMs = Math.max(idleTimeoutMs(), 40 * 60_000);
-  let r: Awaited<ReturnType<typeof runPiStage>> = {
-    killed: false,
-    structured: undefined,
-    finalResult: '',
-    code: 0,
-    stderrTail: '',
-    timedOut: false,
-  };
+  let r: Awaited<ReturnType<typeof runPiStage>> = placeholderStageResult({
+    channel: 'remoteverify',
+  });
   if (vulns.length > 0) {
     try {
       r = await withVerifyGate(() =>
@@ -7787,6 +7946,8 @@ async function runStagePipeline(
       text: `▶ 分环节运行（${mode === 'only' ? '仅本环节' : '从此到末尾'}）：${stages.join(' → ')}`,
     });
     let carry: any[] | undefined;
+    // 代码级验证的组级完成度：合并评级模式下用它门禁「已合并二次评级」权威标记。
+    let verifyPool: GroupOutcomeCounts | null = null;
     for (const st of stages) {
       if (st === 'dedup') {
         const r = await stageDedup(projectId, codeDir);
@@ -7795,6 +7956,7 @@ async function runStagePipeline(
       } else if (st === 'codeverify') {
         const r = await stageCodeVerify(projectId, codeDir, carry);
         if (r.killed) return;
+        verifyPool = r.pool;
         carry = r.findings;
       } else if (st === 'regrade') {
         if (isMergeVerifyRegrade() && carry && stages.includes('codeverify')) {
@@ -7804,12 +7966,12 @@ async function runStagePipeline(
           }));
           db.prepare('DELETE FROM vulnerabilities WHERE project_id = ?').run(projectId);
           saveVulnerabilities(projectId, finalFindings);
-          recordEvent(projectId, {
-            kind: 'system',
-            agent: '主控',
-            tool: '',
-            text: '✓ 已合并二次评级到代码级验证（省一轮评级 fan-out），直接落库',
-          });
+          recordStageCompletion(
+            projectId,
+            '代码级验证（含二次评级）',
+            '✓ 已合并二次评级到代码级验证（省一轮评级 fan-out），直接落库',
+            verifyPool
+          );
           carry = finalFindings;
         } else {
           const r = await stageRegrade(projectId, codeDir, carry);
@@ -7912,6 +8074,8 @@ async function runStagePipeline(
 /* ------------------------------ 队列调度 ------------------------------ */
 async function runJob(job: Job): Promise<void> {
   runningKind.set(job.id, job.kind);
+  // 新一轮运行开始：递增世代，使被取代实例的提交令牌立即失效（防止迟到写入覆盖新结果）。
+  advanceGeneration(job.id, newId('job_'));
   // 新任务真正开始：清除上一轮可能残留的中止标志，并登记为"在途"。
   cancelledProjects.delete(job.id);
   verifyKilled.delete(job.id);
@@ -7936,7 +8100,17 @@ async function runJob(job: Job): Promise<void> {
     inFlight.delete(job.id);
     running.delete(job.id);
     runningKind.delete(job.id);
-    mainStageResolvers.delete(job.id);
+    // 精确结算该项目下全部未结算的阶段实例，并等待其收尾（有界）。
+    // 原实现只 `mainStageResolvers.delete(job.id)`，会把多通道（multi）永不结算的 Promise 留下。
+    const settled = await forceSettleProjectAndWait(job.id, 'runner_exit');
+    if (settled.forced > 0 || settled.remaining > 0) {
+      recordEvent(job.id, {
+        kind: 'system',
+        agent: '主控',
+        tool: '',
+        text: `⚠ 任务结束时强制结算了 ${settled.forced} 个 Pi 阶段实例（剩余未结算 ${settled.remaining}）`,
+      });
+    }
 
     // 防护：异步已退出但 DB 仍标 running（典型：killed 早退未改状态）→ 自动暂停，避免假 running 占列表。
     if (!isVerifyJobKind(job.kind) && !restartRequests.has(job.id)) {
@@ -10186,23 +10360,25 @@ function isVerifyActive(projectId: string): boolean {
  * ⚠ 背景：`审计完成`(result) 由 streamParser 对【每一个 Pi Agent 进程】会话结束都产出
  * （streamParser.ts：type==='result' → text='审计完成'），只代表某个 Pi Agent 阶段跑完，
  * 并不代表整条流水线（子智能体扫描 → 去重 → 代码级验证 → 二次评级）已走完，故不能用它判定完成。
- * 只有当后处理流水线的**收尾阶段**真正跑完时才会落下这些标记（三者取其最新）：
+ * 只有当后处理流水线的**收尾阶段真正跑完全部预期组**时才会落下这些标记（三者取其最新）：
  *   - `✓ 实战二次评级完成`（默认开启二次评级时的收尾）
  *   - `✓ 已合并二次评级到代码级验证`（合并评级模式的收尾）
  *   - `✓ 代码级验证完成`（关闭二次评级时的收尾；也是所有全流程都必经的核验阶段）
  * 只跑到子智能体扫描/覆盖补跑就中断的项目**不会**有这些标记，从而不会被误判为“代码审计完成”。
+ *
+ * ⚠ 标记清单唯一来源 = piStageGuard.AUDIT_PIPELINE_DONE_MARKERS。
+ * 与之配套的"部分完成"事件（`⚠ …部分完成：…`）刻意不含这些子串，
+ * 因此**部分完成不会被当成完整阶段结束**（不变式由 piStageGuard.test.ts 断言）。
  */
 function lastAuditPipelineDoneTs(projectId: string): number | null {
+  const where = AUDIT_PIPELINE_DONE_MARKERS.map(() => 'text LIKE ?').join(' OR ');
+  const params = AUDIT_PIPELINE_DONE_MARKERS.map((m) => `%${m}%`);
   const r = db
     .prepare(
       `SELECT MAX(ts) AS ts FROM agent_events
-       WHERE project_id = ? AND kind = 'system' AND (
-         text LIKE '%✓ 实战二次评级完成%'
-         OR text LIKE '%✓ 已合并二次评级到代码级验证%'
-         OR text LIKE '%✓ 代码级验证完成%'
-       )`
+       WHERE project_id = ? AND kind = 'system' AND (${where})`
     )
-    .get(projectId) as { ts: number | null } | undefined;
+    .get(projectId, ...params) as { ts: number | null } | undefined;
   return r?.ts ?? null;
 }
 
@@ -10306,6 +10482,18 @@ function auditFinishedCleanly(projectId: string): boolean {
   if (ts == null) return false;
   return !hasAuditWorkAfter(projectId, ts);
 }
+
+/**
+ * 仅供测试使用的接缝（零运行时影响）：暴露"审计流水线收尾判定"与阶段完成事件生成，
+ * 用于验证**部分完成事件不会被当成完整阶段结束标记**（piStageGuard.test.ts 在用）。
+ * 只暴露被测试实际消费的成员；stageFullyComplete 是内部实现细节，不在此暴露。
+ */
+export const __testingAuditPipelineCompletion = {
+  lastAuditPipelineDoneTs,
+  auditFinishedCleanly,
+  inferResumeAuditStage,
+  recordStageCompletion,
+};
 
 /** 最新一轮靶机验证是否【干净收尾】（同审计规则，锚点为「验证完成」）。 */
 function verifyFinishedCleanly(projectId: string): boolean {
@@ -10520,9 +10708,37 @@ export function restartAudit(projectId: string, chainVerify = false): boolean {
  * 若目标正在运行，先安全中断，由 runJob.finally 在彻底清理后按 reprocess 重排。
  * @param chainVerify 重跑完成后是否继续靶机验证。
  */
+/**
+ * 未确认停止（blockingStops）的旧进程会阻断同项目再次启动。
+ * 默认**不允许**凭一次重跑操作越过该状态：这里同步拒绝，并顺带发起一次即时复查，
+ * 确认停止后由 sweepStops 的 tick 自动放行（queued 的任务会被 scheduleStartNext 拉起）。
+ */
+function refuseRestartWhileStopUnconfirmed(projectId: string, action: string): boolean {
+  if (!hasBlockingStop(projectId)) return false;
+  recordEvent(projectId, {
+    kind: 'error',
+    agent: '主控',
+    tool: '',
+    text: `⚠ 上一轮进程尚未确认停止（${blockingStopCount(projectId)} 条阻断记录），已拒绝本次${action}；系统会持续复查，确认后自动放行`,
+  });
+  void sweepStops({
+    onEvent: (id, kind, text) => {
+      try {
+        recordEvent(id, { kind, agent: '主控', tool: '', text });
+      } catch {
+        /* ignore */
+      }
+    },
+  }).catch(() => {
+    /* ignore */
+  });
+  return true;
+}
+
 export function restartReprocess(projectId: string, chainVerify = false): boolean {
   const p = getProject(projectId);
   if (!p) return false;
+  if (refuseRestartWhileStopUnconfirmed(projectId, '重跑')) return false;
   requestCancel(projectId); // 中止仍在途的旧异步，避免双流水线
   stopEnvChannel(projectId);
   verifyKilled.add(projectId);
@@ -10570,6 +10786,7 @@ export function enqueueStage(projectId: string, stage: PipeStage, mode: 'only' |
 export function restartStage(projectId: string, stage: PipeStage, mode: 'only' | 'from'): boolean {
   const p = getProject(projectId);
   if (!p) return false;
+  if (refuseRestartWhileStopUnconfirmed(projectId, '分环节运行')) return false;
   const side = stageSide(stage);
   requestCancel(projectId); // 中止仍在途的旧异步，避免双流水线
   stopEnvChannel(projectId);
