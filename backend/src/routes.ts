@@ -15,8 +15,9 @@ import {
 } from './projectsService';
 import {
   enqueueAudit,
-  enqueueVerify,
+  enqueueVerifyDetailed,
   enqueueVerifyOne,
+  explainVerifyEnqueueBlock,
   clearProjectEnv,
   retryEnvPrebuild,
   recoverEnvFalseFailures,
@@ -1520,9 +1521,16 @@ router.post('/projects/:id/pause', (req, res) => {
 });
 
 router.post('/projects/:id/resume', (req, res) => {
-  if (!getProject(req.params.id)) return res.status(404).json({ error: '项目不存在' });
+  const project = getProject(req.params.id);
+  if (!project) return res.status(404).json({ error: '项目不存在' });
   const ok = resumeProject(req.params.id);
   if (!ok) {
+    // M-B：审计已完成的项目，"继续"实质就是再入队远程验证；此时若失败，
+    // 用零副作用的只读解释给出准确原因（典型：工作区/源码包已被清理），
+    // 而不是笼统的"可能已在运行/排队中，或不满足当前策略"。
+    const rejection =
+      project.status === 'completed' ? explainVerifyEnqueueBlock(req.params.id) : null;
+    if (rejection) return res.status(rejection.status).json({ error: rejection.message, code: rejection.code });
     return res.status(409).json({
       error: '无法继续：任务可能已在运行/排队中，或不满足当前策略（如「仅 Web 端」筛选）',
     });
@@ -1543,8 +1551,12 @@ router.post('/projects/:id/verify', (req, res) => {
     db.prepare('UPDATE projects SET opt_verify_history = ? WHERE id = ?').run(vh ? 1 : 0, req.params.id);
     invalidateProjectStatusReads();
   }
-  const ok = enqueueVerify(req.params.id);
-  if (!ok) return res.status(409).json({ error: '验证已在进行中或排队中' });
+  // M-B：返回结构化拒绝原因（code + 准确 message + 对应 HTTP 状态），
+  // 不再把"工作区/源码包已不存在"等前置缺失一律误报成"验证已在进行中或排队中"。
+  const outcome = enqueueVerifyDetailed(req.params.id);
+  if (!outcome.ok) {
+    return res.status(outcome.status).json({ error: outcome.message, code: outcome.code });
+  }
   res.json({ ok: true });
 });
 
@@ -1632,7 +1644,13 @@ router.post('/projects/:id/reverify', (req, res) => {
     invalidateProjectStatusReads();
   }
   const ok = restartVerify(req.params.id);
-  if (!ok) return res.status(409).json({ error: '验证已在进行中或排队中' });
+  if (!ok) {
+    // M-B：先问"到底为什么被拒"（零副作用的只读解释），再退回笼统文案。
+    // 这样"工作区/源码包已不存在"不会再被误报成"验证已在进行中或排队中"。
+    const rejection = explainVerifyEnqueueBlock(req.params.id);
+    if (rejection) return res.status(rejection.status).json({ error: rejection.message, code: rejection.code });
+    return res.status(409).json({ error: '验证已在进行中或排队中' });
+  }
   res.json({ ok: true });
 });
 

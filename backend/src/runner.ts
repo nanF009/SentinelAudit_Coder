@@ -5675,17 +5675,56 @@ async function doVerify(projectId: string, resume = false): Promise<void> {
   const vp2 = getProject(projectId);
   if (!vp2 || vp2.verify_status !== 'running') return;
   if (!targetUp) {
-    finishVerify(projectId, 'failed', await resolveTargetUpFailureReason(projectId, codeDir));
+    const reason = await resolveTargetUpFailureReason(projectId, codeDir);
+    // M-A：靶机没起来 ⇒ 本批漏洞一次实测都没做过，逐漏洞账本必须一并收尾为 restricted。
+    // 只改项目级 verify_status 会让账本永久停在 pending（前端一直显示"待验证 N"）。
+    // 已有终态（success/restricted/failed/timeout）会被保留，因此不会覆盖先前成功的结论。
+    const blocked = markVerificationItemsEnvBlocked(
+      projectId,
+      `靶机环境未就绪，远程验证未执行：${reason}`
+    );
+    if (blocked > 0) {
+      recordEvent(
+        projectId,
+        {
+          kind: 'system',
+          agent: '主控',
+          tool: '',
+          text: `↳ 已将 ${blocked} 个漏洞在验证账本中标记为受限（靶机未就绪，未执行实测）；漏洞发现本身完整保留`,
+        },
+        true,
+        'verify'
+      );
+    }
+    finishVerify(projectId, 'failed', reason);
     return;
   }
   if (!(await isTargetFullyReady(projectId, codeDir))) {
-    finishVerify(
+    const notReadyReason = isExternallyManagedTarget(codeDir)
+      ? '外部靶机尚未可达（mode=external），请由 Cursor Agent 重新拉起后再续跑'
+      : '靶机尚未真实就绪（容器未运行或 HTTP 地址不可达），请稍后重试或检查 Docker';
+    // M-A（补齐）：与上面的 !targetUp 属同一缺陷类 —— 靶机不可用 ⇒ 本批漏洞一次实测都没做过，
+    // 逐漏洞账本必须一并收尾为 restricted，否则会永久停在 pending（前端一直显示"待验证 N"）。
+    // 处理范围与项目级验证语义一致：仅 严重/高危/中危 且尚未有终态结论的条目。
+    const blocked = markVerificationItemsEnvBlocked(
       projectId,
-      'failed',
-      isExternallyManagedTarget(codeDir)
-        ? '外部靶机尚未可达（mode=external），请由 Cursor Agent 重新拉起后再续跑'
-        : '靶机尚未真实就绪（容器未运行或 HTTP 地址不可达），请稍后重试或检查 Docker'
+      `靶机尚未真实就绪，远程验证未执行：${notReadyReason}`
     );
+    if (blocked > 0) {
+      recordEvent(
+        projectId,
+        {
+          kind: 'system',
+          agent: '主控',
+          tool: '',
+          text: `↳ 已将 ${blocked} 个漏洞在验证账本中标记为受限（靶机未真实就绪，未执行实测）；漏洞发现本身完整保留`,
+        },
+        true,
+        'verify'
+      );
+    }
+    // 项目级语义保持不变：verify_error 仍是原文案
+    finishVerify(projectId, 'failed', notReadyReason);
     return;
   }
 
@@ -5786,17 +5825,56 @@ async function doVerifyChain(projectId: string): Promise<void> {
   const vp2 = getProject(projectId);
   if (!vp2 || vp2.verify_status !== 'running') return;
   if (!targetUp) {
-    finishVerify(projectId, 'failed', await resolveTargetUpFailureReason(projectId, codeDir));
+    const reason = await resolveTargetUpFailureReason(projectId, codeDir);
+    // M-A（补齐）：组合链验证同样依赖可用靶机。它不负责逐个实测单漏洞，只负责组合链；
+    // 因此这里只收尾"仍未有终态结论"的 严重/高危/中危 条目（这些正是本次链式验证无法推进、
+    // 若不收尾就会一直停在 pending 的记录），已有 success/failed/timeout/restricted 一律保留。
+    const blocked = markVerificationItemsEnvBlocked(
+      projectId,
+      `靶机环境未就绪，组合链验证未执行：${reason}`
+    );
+    if (blocked > 0) {
+      recordEvent(
+        projectId,
+        {
+          kind: 'system',
+          agent: '主控',
+          tool: '',
+          text: `↳ 已将 ${blocked} 个尚无结论的漏洞在验证账本中标记为受限（靶机未就绪，组合链验证未执行）；漏洞发现本身完整保留`,
+        },
+        true,
+        'verify'
+      );
+    }
+    finishVerify(projectId, 'failed', reason);
     return;
   }
   if (!(await isTargetFullyReady(projectId, codeDir))) {
-    finishVerify(
+    const notReadyReason = isExternallyManagedTarget(codeDir)
+      ? '外部靶机尚未可达（mode=external），请由 Cursor Agent 重新拉起后再续跑'
+      : '靶机尚未真实就绪（容器未运行或 HTTP 地址不可达），请稍后重试或检查 Docker';
+    // M-A（补齐最后一处）：组合链验证同样依赖可用靶机；靶机未真实就绪 ⇒ 无法推进。
+    // 与上面 !targetUp 同口径：只收尾"尚无终态结论"的 严重/高危/中危 条目，
+    // 已有 success/failed/timeout/restricted 一律保留。
+    const blocked = markVerificationItemsEnvBlocked(
       projectId,
-      'failed',
-      isExternallyManagedTarget(codeDir)
-        ? '外部靶机尚未可达（mode=external），请由 Cursor Agent 重新拉起后再续跑'
-        : '靶机尚未真实就绪（容器未运行或 HTTP 地址不可达），请稍后重试或检查 Docker'
+      `靶机尚未真实就绪，组合链验证未执行：${notReadyReason}`
     );
+    if (blocked > 0) {
+      recordEvent(
+        projectId,
+        {
+          kind: 'system',
+          agent: '主控',
+          tool: '',
+          text: `↳ 已将 ${blocked} 个尚无结论的漏洞在验证账本中标记为受限（靶机未真实就绪，组合链验证未执行）；漏洞发现本身完整保留`,
+        },
+        true,
+        'verify'
+      );
+    }
+    // 项目级语义保持不变：verify_error 仍是原文案
+    finishVerify(projectId, 'failed', notReadyReason);
     return;
   }
 
@@ -7884,6 +7962,51 @@ function finalizeVerifyOutcome(projectId: string): void {
   finishVerify(projectId, 'completed', null);
 }
 
+/**
+ * 逐漏洞账本的终态集合。语义与 verificationStore.TERMINAL_STATES 完全一致；
+ * 这里只做**只读判断**（不新增状态、不改状态机），用于"环境阻断收尾"时判断某条目是否已有结论。
+ */
+const TERMINAL_VERIFICATION_STATES = new Set(['success', 'restricted', 'failed', 'timeout']);
+
+/**
+ * 环境阻断收尾（M-A）：靶机环境搭建失败、远程验证**根本没有执行**时，把全部
+ * 「严重/高危/中危」漏洞中**尚未有终态结论**的账本条目落为 `restricted`，并把原因写入 `error`。
+ *
+ * 为什么必须做：项目级 `verify_status` 与逐漏洞 `vulnerability_verifications.state` 是两套独立状态；
+ * 环境失败时验证阶段被整体跳过（从未入队），批量路径又从不写逐项状态，于是这些记录会**永久停在
+ * pending**，前端一直显示"待验证 N"，与"验证实际没跑"不符。
+ *
+ * 语义与边界：
+ * - `restricted` 表示"未完成实测/被环境挡住"，**既不是"验证失败"，也不是"漏洞无效"**；
+ *   `vulnerabilities` 表（漏洞发现本身）**一个字段都不动**。
+ * - **不覆盖已有终态**：success / restricted / failed / timeout 一律保留 ⇒ 已成功的记录不会被冲掉，
+ *   已有失败/超时结论也不会被改写。
+ * - **幂等**：只有非终态条目会被流转；`setVerificationItemState()` 仅在 `queued` 流转时 +1
+ *   attempt_count，而本函数从不写 `queued` ⇒ 重复调用既不重复计数、也不重复排队。
+ * - 先 `ensureProjectVerificationItems()` 保证条目存在，避免 UPDATE 静默落空。
+ *
+ * @returns 本次实际被流转（pending → restricted）的条目数
+ */
+export function markVerificationItemsEnvBlocked(projectId: string, reason: string): number {
+  ensureProjectVerificationItems(projectId);
+  const rows = db
+    .prepare(
+      `SELECT v.id AS id, COALESCE(vv.state, '') AS state
+         FROM vulnerabilities v
+         LEFT JOIN vulnerability_verifications vv
+           ON vv.project_id = v.project_id AND vv.vulnerability_id = v.id
+        WHERE v.project_id = ? AND lower(v.severity) IN ('critical','high','medium')`
+    )
+    .all(projectId) as { id: string; state: string }[];
+  let changed = 0;
+  for (const row of rows) {
+    if (TERMINAL_VERIFICATION_STATES.has(row.state)) continue;
+    setVerificationItemState(projectId, row.id, 'restricted', reason);
+    changed += 1;
+  }
+  return changed;
+}
+
 /** 校正误标为 completed 但仍有待验证项的项目；可选自动续跑。 */
 export function reconcileFalseCompletedVerify(autoResume = false): string[] {
   const fixed: string[] = [];
@@ -8186,6 +8309,26 @@ async function runJob(job: Job): Promise<void> {
                   verify_finished_at: now(),
                   verify_error: '靶机环境搭建失败，未进行远程验证',
                 });
+                // M-A：项目级状态之外，逐漏洞账本也必须一并收尾。
+                // 这里远程验证**从未入队**，批量路径又不会写逐项状态，账本会永久停在 pending，
+                // 前端一直显示"待验证 N"。故把适用漏洞标为 restricted（受环境阻断，非失败、非无效）。
+                const blockedItems = markVerificationItemsEnvBlocked(
+                  job.id,
+                  '靶机环境搭建失败，远程验证未执行'
+                );
+                if (blockedItems > 0) {
+                  recordEvent(
+                    job.id,
+                    {
+                      kind: 'system',
+                      agent: '主控',
+                      tool: '',
+                      text: `↳ 已将 ${blockedItems} 个漏洞在验证账本中标记为受限（环境阻断，远程验证未执行）；漏洞发现本身完整保留，环境恢复并重新上传源码后可重新验证`,
+                    },
+                    true,
+                    'verify'
+                  );
+                }
               } else {
                 enqueueVerify(job.id);
               }
@@ -9818,35 +9961,56 @@ export function enqueueReprocess(projectId: string, chainVerify = false, continu
 }
 
 /**
- * 远程验证入队门控：工作区在即可。靶机按当前源码搭建，不再用 Git/镜像标签拦截。
+ * 工作区/源码包缺失时对用户可见的统一理由：HTTP 响应与事件文案共用同一份，
+ * 避免各写一套导致"工作区缺失"被误报成别的拒绝原因。
  */
-function strictVerifyQueueGate(projectId: string, resetQueued = false): boolean {
+export const VERIFY_WORKSPACE_MISSING_MESSAGE =
+  '工作区或源码包已不存在（审计完成后源码已被清理并无法重建），无法搭建靶机环境；请重新上传源码包后再发起验证';
+
+/**
+ * 工作区是否就绪（靶机按当前源码搭建，不再用 Git/镜像标签拦截）。
+ *
+ * 默认行为（silent 未开）会记录诊断：env 置 failed + 落一条 error 事件——这是历史行为，
+ * 供所有真正"要入队验证"的调用方使用。M-B 只把这条**事件 phase 从 audit 改为 verify**
+ * （工作区缺失属于验证链路，不是审计链路），拒绝行为本身一字未改。
+ *
+ * `silent=true` 只做只读判断（不写库、不落事件），供 HTTP 层"解释为什么被拒"复用，
+ * 避免同一次拒绝被记两遍事件。
+ */
+function verifyWorkspaceReady(
+  projectId: string,
+  opts: { resetQueued?: boolean; silent?: boolean } = {}
+): boolean {
   const project = getProject(projectId);
   if (!project) return false;
   const codeDir = project.workspace_path || '';
-  if (!codeDir || !fs.existsSync(codeDir)) {
-    setEnvStatus(projectId, 'failed', null);
-    if (resetQueued && project.verify_status === 'queued') {
-      setVerifyStatus(projectId, 'none', {
-        verify_started_at: null,
-        verify_finished_at: null,
-        verify_error: '工作区不存在',
-      });
-    }
-    recordEvent(
-      projectId,
-      {
-        kind: 'error',
-        agent: '主控',
-        tool: '',
-        text: '⛔ 拒绝远程验证：工作区不存在',
-      },
-      true,
-      'audit'
-    );
-    return false;
+  if (codeDir && fs.existsSync(codeDir)) return true;
+  if (opts.silent) return false;
+  setEnvStatus(projectId, 'failed', null);
+  if (opts.resetQueued && project.verify_status === 'queued') {
+    setVerifyStatus(projectId, 'none', {
+      verify_started_at: null,
+      verify_finished_at: null,
+      verify_error: '工作区不存在',
+    });
   }
-  return true;
+  recordEvent(
+    projectId,
+    {
+      kind: 'error',
+      agent: '主控',
+      tool: '',
+      text: '⛔ 拒绝远程验证：工作区/源码包已不存在，无法重建靶机环境',
+    },
+    true,
+    'verify'
+  );
+  return false;
+}
+
+/** 远程验证入队门控（保持原签名与语义，供既有 6 处调用方复用）。 */
+function strictVerifyQueueGate(projectId: string, resetQueued = false): boolean {
+  return verifyWorkspaceReady(projectId, { resetQueued });
 }
 
 /**
@@ -9854,22 +10018,38 @@ function strictVerifyQueueGate(projectId: string, resetQueued = false): boolean 
  * - pending=true：项目正在跑验证/在途，已暂存该标题，待当前验证收尾（不关靶机）后自动验证 → 前端应显示"等待验证"。
  * - queued=true：已直接入队开始单漏洞验证（情形①靶机已停会 start、情形②无靶机会重搭）。
  */
-export function enqueueVerifyOne(projectId: string, title: string): { queued: boolean; pending: boolean } {
+export function enqueueVerifyOne(
+  projectId: string,
+  title: string
+): { queued: boolean; pending: boolean; reason?: string } {
+  // M-B：拒绝时带一条**可读原因**（不再静默返回 queued=false/pending=false）。
+  // 注意这里刻意不复用 verifyEnqueueRejection：本入口对"验证正在跑/已排队"是**合法暂存**
+  // （pending=true，等当前验证收尾后自动补验），不能按拒绝处理。
   if (!isPiJobsEnabled()) {
     console.warn(`[code] Pi 任务已停摆，拒绝单漏洞验证 ${projectId}`);
-    return { queued: false, pending: false };
+    return { queued: false, pending: false, reason: 'Pi 任务已停摆（claude_jobs_enabled=0）' };
   }
   const p = getProject(projectId);
-  if (!p || p.status !== 'completed' || !title) return { queued: false, pending: false };
-  if (!shouldRemoteVerify(projectId)) return { queued: false, pending: false };
-  if (!strictVerifyQueueGate(projectId)) return { queued: false, pending: false };
+  if (!p) return { queued: false, pending: false, reason: '项目不存在' };
+  if (p.status !== 'completed') {
+    return { queued: false, pending: false, reason: '请先完成漏洞审计后再发起验证' };
+  }
+  if (!title) return { queued: false, pending: false, reason: '缺少漏洞标题' };
+  if (!shouldRemoteVerify(projectId)) {
+    return { queued: false, pending: false, reason: '该项目不满足远程验证条件（无 Web 端或受策略限制）' };
+  }
+  if (!strictVerifyQueueGate(projectId)) {
+    return { queued: false, pending: false, reason: VERIFY_WORKSPACE_MISSING_MESSAGE };
+  }
   const norm = (value: string) => String(value || '').replace(/\s+/g, '').toLowerCase();
   const vulnerability = (
     db
       .prepare('SELECT id, title FROM vulnerabilities WHERE project_id = ?')
       .all(projectId) as { id: string; title: string }[]
   ).find((row) => norm(row.title) === norm(title));
-  if (!vulnerability) return { queued: false, pending: false };
+  if (!vulnerability) {
+    return { queued: false, pending: false, reason: `未在该项目漏洞清单中找到「${title}」` };
+  }
   ensureProjectVerificationItems(projectId);
   setVerificationItemState(projectId, vulnerability.id, 'queued');
   // 情形③：正在跑验证 / 有在途任务 / 已在队列 → 暂存，等收尾后再验证（靶机不关）
@@ -10091,24 +10271,130 @@ export function reconcileStrictTargetProvenance(
   };
 }
 
+/** 远程验证入队被拒绝的结构化原因（供 HTTP 层给出准确响应；禁止靠解析错误文案区分）。 */
+export type VerifyQueueRejectCode =
+  | 'pi_disabled'
+  | 'not_found'
+  | 'not_completed'
+  | 'not_web_only'
+  | 'already_running'
+  | 'already_queued'
+  | 'workspace_missing';
+
+export interface VerifyQueueRejection {
+  code: VerifyQueueRejectCode;
+  /** HTTP 状态码：404 不存在 / 400 前置条件未满足 / 409 状态冲突。 */
+  status: number;
+  message: string;
+}
+
+/** 入队结果：ok=true 表示已入队；否则携带结构化拒绝原因。 */
+export type VerifyEnqueueOutcome = { ok: true } | ({ ok: false } & VerifyQueueRejection);
+
+function piDisabledRejection(): VerifyQueueRejection {
+  return {
+    code: 'pi_disabled',
+    status: 409,
+    message: 'Pi 任务已停摆（claude_jobs_enabled=0），无法入队远程验证',
+  };
+}
+
+/**
+ * 远程验证入队前置条件判定（**与改造前完全同序同条件**，只把每条拒绝贴上结构化标签）。
+ * 返回 null = 可入队。
+ *
+ * 刻意**不**新增基于 DB `verify_status` 的拒绝条件：`restartVerify`/启动期孤儿恢复等入口会
+ * 在 DB 状态仍显示 running/queued 时合法地重新入队（它们先自行清队列/改状态），
+ * 用 DB 状态去拒绝会引入回归。运行/排队只依据内存真相（isBusy / queue）。
+ */
+function verifyEnqueueRejection(
+  projectId: string,
+  mode: 'full' | 'chain',
+  opts: { silentGate?: boolean } = {}
+): VerifyQueueRejection | null {
+  const p = getProject(projectId);
+  if (!p) return { code: 'not_found', status: 404, message: '项目不存在' };
+  const auditReady = mode === 'chain' ? hasAuditForChain(p) : p.status === 'completed';
+  if (!auditReady) {
+    return {
+      code: 'not_completed',
+      status: 400,
+      message:
+        mode === 'chain'
+          ? '审计尚未产出可用结果，无法仅重跑组合链验证'
+          : '请先完成漏洞审计后再发起验证',
+    };
+  }
+  if (!shouldRemoteVerify(projectId)) {
+    return {
+      code: 'not_web_only',
+      status: 409,
+      message: '该项目不满足远程验证条件（无 Web 端，或受「仅处理含 Web 端项目」/Cursor 编排托管限制）',
+    };
+  }
+  if (isBusy(projectId)) {
+    return { code: 'already_running', status: 409, message: '该项目的远程验证已在运行中' };
+  }
+  if (queue.some((j) => j.id === projectId)) {
+    return { code: 'already_queued', status: 409, message: '该项目的远程验证任务已排队，等待调度' };
+  }
+  if (!verifyWorkspaceReady(projectId, { silent: opts.silentGate === true })) {
+    return { code: 'workspace_missing', status: 409, message: VERIFY_WORKSPACE_MISSING_MESSAGE };
+  }
+  return null;
+}
+
+/**
+ * 只读解释"该项目此刻为什么不能发起远程验证"（**零副作用**：不写库、不落事件、不入队）。
+ * 供 HTTP 层在别处（restartVerify / resumeProject）已经失败后，给出准确原因，
+ * 避免把"工作区/源码包已被清理"这类前置缺失误报成"验证已在进行中或排队中"。
+ */
+export function explainVerifyEnqueueBlock(
+  projectId: string,
+  mode: 'full' | 'chain' = 'full'
+): VerifyQueueRejection | null {
+  if (!isPiJobsEnabled()) return piDisabledRejection();
+  return verifyEnqueueRejection(projectId, mode, { silentGate: true });
+}
+
+/** 前置条件已通过后真正入队（清中止标志 → 置 queued → 压队列 → 调度）。 */
+function pushVerifyJob(projectId: string, opts: { resume?: boolean; chainOnly?: boolean }): void {
+  verifyKilled.delete(projectId);
+  cancelledProjects.delete(projectId);
+  setVerifyStatus(projectId, 'queued', { verify_error: null });
+  queue.push(
+    opts.chainOnly
+      ? { id: projectId, kind: 'verify', chainOnly: true }
+      : { id: projectId, kind: 'verify', resume: opts.resume === true }
+  );
+  // 不预搭：拿到验证槽进入 running 后由 ensureTargetUp / doVerify 按需搭建
+  scheduleStartNext();
+}
+
 export function enqueueVerify(projectId: string, resume = false): boolean {
   if (!isPiJobsEnabled()) {
     console.warn(`[code] Pi 任务已停摆，拒绝入队验证 ${projectId}`);
     return false;
   }
-  const p = getProject(projectId);
-  if (!p) return false;
-  if (p.status !== 'completed') return false; // 必须先完成审计
-  if (!shouldRemoteVerify(projectId)) return false;
-  if (isBusy(projectId) || queue.some((j) => j.id === projectId)) return false;
-  if (!strictVerifyQueueGate(projectId)) return false;
-  verifyKilled.delete(projectId);
-  cancelledProjects.delete(projectId);
-  setVerifyStatus(projectId, 'queued', { verify_error: null });
-  queue.push({ id: projectId, kind: 'verify', resume });
-  // 不预搭：拿到验证槽进入 running 后由 ensureTargetUp / doVerify 按需搭建
-  scheduleStartNext();
+  if (verifyEnqueueRejection(projectId, 'full')) return false;
+  pushVerifyJob(projectId, { resume });
   return true;
+}
+
+/**
+ * 入队远程验证并返回**结构化**拒绝原因（HTTP 层专用）。
+ * 与 {@link enqueueVerify} 共享同一套判定，行为完全一致；区别只是把"为什么不行"带回去，
+ * 避免路由层把所有拒绝一律回成"验证已在进行中或排队中"。
+ */
+export function enqueueVerifyDetailed(projectId: string, resume = false): VerifyEnqueueOutcome {
+  if (!isPiJobsEnabled()) {
+    console.warn(`[code] Pi 任务已停摆，拒绝入队验证 ${projectId}`);
+    return { ok: false, ...piDisabledRejection() };
+  }
+  const rejection = verifyEnqueueRejection(projectId, 'full');
+  if (rejection) return { ok: false, ...rejection };
+  pushVerifyJob(projectId, { resume });
+  return { ok: true };
 }
 
 /**
@@ -10128,18 +10414,9 @@ export function enqueueVerifyChain(projectId: string): boolean {
     console.warn(`[code] Pi 任务已停摆，拒绝组合链验证 ${projectId}`);
     return false;
   }
-  const p = getProject(projectId);
-  if (!p) return false;
-  if (!hasAuditForChain(p)) return false; // 审计未产出结果（如审计跑到一半被暂停）
-  if (!shouldRemoteVerify(projectId)) return false;
-  if (isBusy(projectId) || queue.some((j) => j.id === projectId)) return false;
-  if (!strictVerifyQueueGate(projectId)) return false;
-  verifyKilled.delete(projectId);
-  cancelledProjects.delete(projectId);
-  setVerifyStatus(projectId, 'queued', { verify_error: null });
-  queue.push({ id: projectId, kind: 'verify', chainOnly: true });
-  // 不预搭：进入 running 后再按需搭建
-  scheduleStartNext();
+  // 与 enqueueVerify 共享同一套判定（mode='chain' 只放宽审计前置条件），行为与改造前一致。
+  if (verifyEnqueueRejection(projectId, 'chain')) return false;
+  pushVerifyJob(projectId, { chainOnly: true });
   return true;
 }
 
