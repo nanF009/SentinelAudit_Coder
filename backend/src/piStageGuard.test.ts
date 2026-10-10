@@ -23,6 +23,7 @@ import {
   buildPartialCompletionText,
   canSubmit,
   commitResult,
+  createOpenToolCallTracker,
   createStageGuard,
   createTerminator,
   currentGeneration,
@@ -1096,5 +1097,188 @@ test('B：lastAuditPipelineDoneTs 不会把部分完成事件当成完整阶段�
     })();
   } catch (error) {
     if (error !== rollback) throw error;
+  }
+});
+
+/* ============================== 15. M1：未闭合工具调用门控 ============================== */
+
+/** 已确认停止的终结器（隔离"停止确认"与"工具门控"两个变量）。 */
+function stoppedTerminator(): FakeTerminator {
+  const t = new FakeTerminator();
+  t.probeState = 'stopped';
+  t.waitQueue = ['stopped'];
+  return t;
+}
+
+test('M1-tracker：按 toolCallId 配对，重复 start/重复 end/迟到事件都不破坏计数', () => {
+  const tr = createOpenToolCallTracker();
+  assert.deepEqual(tr.observe({ type: 'tool_execution_start', toolCallId: 'a' }), {
+    open: 1,
+    changed: true,
+  });
+  // 重复 start 同一 id：幂等，不重复计数、也不算"变化"
+  assert.deepEqual(tr.observe({ type: 'tool_execution_start', toolCallId: 'a' }), {
+    open: 1,
+    changed: false,
+  });
+  assert.deepEqual(tr.observe({ type: 'tool_execution_start', toolCallId: 'b' }), {
+    open: 2,
+    changed: true,
+  });
+  // 中途 update：不改变计数、也不算变化
+  assert.deepEqual(tr.observe({ type: 'tool_execution_update', toolCallId: 'b' }), {
+    open: 2,
+    changed: false,
+  });
+  // 迟到 / 未知 end：幂等空操作
+  assert.deepEqual(tr.observe({ type: 'tool_execution_end', toolCallId: 'zzz' }), {
+    open: 2,
+    changed: false,
+  });
+  assert.deepEqual(tr.observe({ type: 'tool_execution_end', toolCallId: 'b' }), {
+    open: 1,
+    changed: true,
+  });
+  // 重复 end 同一 id：幂等
+  assert.deepEqual(tr.observe({ type: 'tool_execution_end', toolCallId: 'b' }), {
+    open: 1,
+    changed: false,
+  });
+  assert.deepEqual(tr.observe({ type: 'tool_execution_end', toolCallId: 'a' }), {
+    open: 0,
+    changed: true,
+  });
+  // 缺 id 的异常事件：合成 id 兜底，仍能成对闭合
+  assert.equal(tr.observe({ type: 'tool_execution_start' }).open, 1);
+  assert.equal(tr.observe({ type: 'tool_execution_end' }).open, 0);
+  // 非对象 / 无关事件不改变计数
+  assert.equal(tr.observe(null).changed, false);
+  assert.equal(tr.observe({ type: 'agent_end' }).changed, false);
+  assert.equal(tr.size, 0);
+  assert.deepEqual(tr.ids(), []);
+});
+
+test('M1：未闭合工具调用期间收到 agent_end → settle 宽限不起算（明确事件只记一次）', async () => {
+  const f = fixture({ settleMs: 80, idleMs: 0, hardMs: 0, terminator: stoppedTerminator() });
+  f.guard.markSpawned(f.child);
+  f.guard.noteToolCalls(1); // 例如前台 docker compose build 正在跑
+  f.guard.noteSessionEnd(); // agent_end
+  f.guard.noteSessionEnd(); // 重复 agent_end：不得重复记事件
+
+  await sleep(240); // 远超 settleMs(80)
+  assert.equal(f.guard.settled, false, '工具未闭合时 settle 不得触发');
+  assert.equal(f.terminator.requests, 0, '不得调用终结器');
+  const deferred = f.events.filter((e) => e.text.includes('已推迟收尾'));
+  assert.equal(deferred.length, 1, '推迟收尾事件只记一次');
+  assert.match(deferred[0].text, /仍有 1 个工具调用/);
+
+  // 工具闭合 + 会话已结束 ⇒ 恢复正常 settle 宽限
+  f.guard.noteToolCalls(0);
+  const r = await f.guard.done;
+  assert.equal(r.facts.terminal, 'settle_grace');
+  assert.equal(r.facts.stopState, 'stopped');
+  assert.equal(r.killed, false);
+  assert.equal(r.timedOut, false, 'agent_end 后正常收尾不得算超时');
+  assert.equal(r.openToolCallsAtSettle, 0);
+  assert.equal(r.stopConfirmed, true, '无未闭合工具时停止确认仍成立');
+});
+
+test('M1：顺序颠倒（先 agent_end 再开工具）同样撤回收尾倒计时', async () => {
+  const f = fixture({ settleMs: 80, idleMs: 0, hardMs: 0, terminator: stoppedTerminator() });
+  f.guard.markSpawned(f.child);
+  f.guard.noteSessionEnd();
+  f.guard.noteToolCalls(1); // agent_end 之后又有工具开始
+  await sleep(240);
+  assert.equal(f.guard.settled, false);
+  assert.equal(
+    f.events.filter((e) => e.text.includes('已推迟收尾')).length,
+    1,
+    '推迟收尾事件只记一次'
+  );
+  await f.guard.forceSettle('runner_exit');
+});
+
+test('M1：多个并行工具调用必须**全部**闭合才允许收尾', async () => {
+  const f = fixture({ settleMs: 60, idleMs: 0, hardMs: 0, terminator: stoppedTerminator() });
+  f.guard.markSpawned(f.child);
+  f.guard.noteToolCalls(3);
+  f.guard.noteSessionEnd();
+  await sleep(150);
+  assert.equal(f.guard.settled, false, '3 个未闭合');
+  f.guard.noteToolCalls(2);
+  await sleep(150);
+  assert.equal(f.guard.settled, false, '还剩 2 个未闭合');
+  f.guard.noteToolCalls(1);
+  await sleep(150);
+  assert.equal(f.guard.settled, false, '还剩 1 个未闭合');
+  f.guard.noteToolCalls(0);
+  const r = await f.guard.done;
+  assert.equal(r.facts.terminal, 'settle_grace', '全部闭合后才收尾');
+  assert.equal(r.openToolCallsAtSettle, 0);
+});
+
+test('M1：工具未闭合时的静默不触发 idle，但 hard 上限仍生效并进入终止流程', async () => {
+  const f = fixture({ settleMs: 0, idleMs: 60, hardMs: 300, terminator: stoppedTerminator() });
+  f.guard.markSpawned(f.child);
+  f.guard.noteToolCalls(1);
+  f.guard.noteSessionEnd();
+
+  await sleep(220); // > idleMs(60)，< hardMs(300)
+  assert.equal(f.guard.settled, false, 'idle 不得在工具未闭合时判定卡死');
+  assert.equal(
+    f.events.filter((e) => e.text.includes('空闲超时已推迟')).length,
+    1,
+    '推迟 idle 的事件只记一次'
+  );
+  assert.equal(
+    f.events.some((e) => e.text.includes('无任何输出')),
+    false,
+    '不得出现 idle 超时终止事件'
+  );
+
+  const r = await f.guard.done; // hard 到点
+  assert.equal(r.facts.terminal, 'hard_timeout');
+  assert.equal(r.timedOut, true, 'hard deadline 仍是不可延长的绝对上限');
+  assert.equal(r.openToolCallsAtSettle, 1, '结算时如实记录未闭合工具数');
+  assert.equal(r.stopConfirmed, false, '仍有未闭合工具 ⇒ 不得断言整树已停');
+  assert.ok(
+    f.events.some((e) => e.text.includes('终止时仍有 1 个工具调用未返回')),
+    '必须记录终止范围与残余风险'
+  );
+});
+
+test('M1：无未闭合工具调用时，原有 settle 行为逐字不变（回归）', async () => {
+  const f = fixture({ settleMs: 70, idleMs: 0, hardMs: 0, terminator: stoppedTerminator() });
+  f.guard.markSpawned(f.child);
+  f.guard.noteSessionEnd();
+  const r = await f.guard.done;
+  assert.equal(r.facts.terminal, 'settle_grace');
+  assert.equal(r.openToolCallsAtSettle, 0);
+  assert.equal(r.stopConfirmed, true);
+  assert.equal(f.events.filter((e) => e.text.includes('已推迟收尾')).length, 0);
+  assert.equal(f.events.filter((e) => e.text.includes('空闲超时已推迟')).length, 0);
+});
+
+test('M1：门控与通道无关，且非 env 通道在无工具调用时行为不变', async () => {
+  const channels = ['main', 'env', 'codeverify', 'remoteverify', 'subagent'] as const;
+  for (const channel of channels) {
+    const f = fixture({ channel, settleMs: 70, idleMs: 0, hardMs: 0, terminator: stoppedTerminator() });
+    f.guard.markSpawned(f.child);
+    // 无工具调用：与基线一致
+    f.guard.noteSessionEnd();
+    const r0 = await f.guard.done;
+    assert.equal(r0.facts.terminal, 'settle_grace', `${channel} 无工具调用时行为不变`);
+    assert.equal(r0.openToolCallsAtSettle, 0);
+
+    // 有未闭合工具：同样被推迟（门控是通道无关的纯事实）
+    const g = fixture({ channel, settleMs: 70, idleMs: 0, hardMs: 0, terminator: stoppedTerminator() });
+    g.guard.markSpawned(g.child);
+    g.guard.noteToolCalls(1);
+    g.guard.noteSessionEnd();
+    await sleep(150);
+    assert.equal(g.guard.settled, false, `${channel} 有未闭合工具时被推迟`);
+    g.guard.noteToolCalls(0);
+    const r1 = await g.guard.done;
+    assert.equal(r1.facts.terminal, 'settle_grace');
   }
 });

@@ -7,6 +7,10 @@
  *  3. 存活探针只读 running，看不到 multi 的 verifyProcs，回收器把活进程误判为僵尸；
  *  4. 旧 killTree 使用无 timeout 的同步 pkill 调用，且不等待、不确认是否真的停止；
  *  5. 迟到写入：被取代的旧实例仍可把结果写进正常结果目录。
+ *  6. M1：`agent_end` 只代表"本 run 不再有循环事件"，**不**代表仍在执行的工具已结束
+ *     （Pi 的 bash 工具自身 detached，`docker compose build` 可能在另一个进程组里继续跑）；
+ *     旧逻辑会在 agent_end 后 2 分钟静默即收尾，把前台长时构建一起杀掉。
+ *     现在用"未闭合工具调用"门控 settle 与 idle（hard 上限不变、不可延长）。
  *
  * 本模块只做纯逻辑与状态机，不 import runner.ts / db.ts，因此可独立单测。
  * 所有进程终止均通过 Terminator 异步发起，绝不使用任何同步终止调用。
@@ -634,7 +638,21 @@ export interface GuardResult extends StageResult {
   channel: StageChannel;
   facts: StageFacts;
   decision: StageDecision;
+  /**
+   * 「整棵树已停止」是否**可权威确认**。
+   *
+   * ⚠ 只在**没有未闭合工具调用**时成立：Pi 的 bash 工具自身就是 detached 的
+   * （`docker compose build` 在**另一个进程组**），因此进程组终止打不到它，
+   * `stopState === 'stopped'`（Pi 自身组已空）**不能**证明这些后代已停止。
+   * 终止时若仍有未闭合工具调用，这里为 false —— 不得据此断言 detached 后代全部停止。
+   */
   stopConfirmed: boolean;
+  /**
+   * 结算瞬间仍未闭合（未收到 `tool_execution_end`）的工具调用数。
+   * > 0 表示终止范围有残余风险：Pi 收到 SIGTERM 后会自行 SIGKILL 其 tracked detached 子进程，
+   * 但平台侧无法权威确认它们已退出（需人工/后续探测确认）。
+   */
+  openToolCallsAtSettle: number;
 }
 
 export interface StageGuardInput {
@@ -673,6 +691,16 @@ export interface StageGuard {
   skipBeforeSpawn(terminal: StageTerminal, message: string): void;
   noteStdout(): void;
   noteStderr(): void;
+  /**
+   * M1：工具调用生命周期门控（由调用方在解析 `tool_execution_start` / `tool_execution_end` 之后调用，
+   * 传入**当前未闭合工具调用数**；集合本身由调用方按 runId 维护）。
+   *
+   * 语义：
+   *  - `openCount > 0`：**推迟** settle 收尾（会话结束信号不再起算宽限），并抑制 idle 误杀；
+   *  - `openCount === 0`：若此前已收到会话结束信号，**恢复**正常的 settle grace；
+   *  - hard deadline **不受影响**（仍是不可延长的绝对上限）。
+   */
+  noteToolCalls(openCount: number): void;
   noteSessionEnd(): void;
   requestStop(reason: StopReason): void;
   forceSettle(reason: StopReason): Promise<GuardResult>;
@@ -1033,6 +1061,88 @@ export function commitResult<T>(token: SubmitToken | null | undefined, write: ()
   return guard.commit(write);
 }
 
+/* ============================== 未闭合工具调用追踪（M1） ============================== */
+
+/** 追踪结果：当前未闭合数与"本次观察是否改变了它"。 */
+export interface ToolCallObservation {
+  /** 当前未闭合工具调用数。 */
+  open: number;
+  /** 本次 observe 是否改变集合（只有变化时才需要通知 guard，避免无谓地重置计时器）。 */
+  changed: boolean;
+}
+
+/**
+ * M1：未闭合工具调用追踪器（纯逻辑、无 I/O，可直接单测）。
+ *
+ * 输入是**已 JSON.parse** 的 Pi json 事件对象（真实结构：
+ * `{type:'tool_execution_start'|'tool_execution_end', toolCallId, toolName, args|result, isError}`）。
+ * 语义：
+ *  - 重复 `start` 同一 id：Set 幂等，不重复计数；
+ *  - 重复 / 迟到 `end`（未知 id 或已闭合）：删除是幂等空操作，计数不变；
+ *  - `tool_execution_update` 等其它事件：计数不变（`changed=false`）；
+ *  - 缺 id 的异常事件用合成 id（`__anon_tool_N`）兜底；`end` 缺 id 时闭掉最早一个合成 id。
+ *
+ * 每个 `runPiStage` 实例各自创建一个 ⇒ 集合天然**按 runId 隔离**。
+ */
+export interface OpenToolCallTracker {
+  observe(obj: unknown): ToolCallObservation;
+  /** 当前未闭合工具调用数。 */
+  readonly size: number;
+  /** 当前未闭合的工具调用标识（供诊断/日志）。 */
+  ids(): string[];
+}
+
+const ANON_TOOL_PREFIX = '__anon_tool_';
+
+function toolCallIdOf(obj: any): string | null {
+  const raw = obj?.toolCallId ?? obj?.tool_call_id ?? obj?.id;
+  if (raw === undefined || raw === null) return null;
+  const s = String(raw).trim();
+  return s ? s : null;
+}
+
+export function createOpenToolCallTracker(): OpenToolCallTracker {
+  const open = new Set<string>();
+  let anonSeq = 0;
+  return {
+    observe(obj: unknown): ToolCallObservation {
+      const o = obj as any;
+      if (!o || typeof o !== 'object') return { open: open.size, changed: false };
+      if (o.type === 'tool_execution_start') {
+        let id = toolCallIdOf(o);
+        if (!id) {
+          anonSeq += 1;
+          id = `${ANON_TOOL_PREFIX}${anonSeq}`;
+        }
+        if (open.has(id)) return { open: open.size, changed: false };
+        open.add(id);
+        return { open: open.size, changed: true };
+      }
+      if (o.type === 'tool_execution_end') {
+        const id = toolCallIdOf(o);
+        if (id) {
+          if (!open.delete(id)) return { open: open.size, changed: false };
+          return { open: open.size, changed: true };
+        }
+        for (const k of open) {
+          if (k.startsWith(ANON_TOOL_PREFIX)) {
+            open.delete(k);
+            return { open: open.size, changed: true };
+          }
+        }
+        return { open: open.size, changed: false };
+      }
+      return { open: open.size, changed: false };
+    },
+    get size(): number {
+      return open.size;
+    },
+    ids(): string[] {
+      return [...open];
+    },
+  };
+}
+
 /* ============================== guard 实现 ============================== */
 
 export function createStageGuard(input: StageGuardInput): StageGuard {
@@ -1066,6 +1176,14 @@ export function createStageGuard(input: StageGuardInput): StageGuard {
   let sessionEnded = false;
   let stopRequested = false;
   let stopFlow: Promise<StopState> | null = null;
+
+  // —— M1：未闭合工具调用门控 ——
+  // 集合本身由调用方按 runId 维护（runner 解析 tool_execution_start/end + toolCallId），
+  // guard 只持有"当前计数"这一纯事实，用于门控 settle 与 idle。
+  let openToolCalls = 0;
+  let agentEndDeferredLogged = false;
+  let idleSuppressedLogged = false;
+  let openToolCallsAtSettle = 0;
 
   let settled = false;
   let result: GuardResult | null = null;
@@ -1107,20 +1225,46 @@ export function createStageGuard(input: StageGuardInput): StageGuard {
   const rearmThreshold = (budgetMs: number): number =>
     Math.max(1, Math.min(TIMER_REARM_MIN_MS, Math.floor(budgetMs / 2)));
 
+  /** 清掉 settle 计时器（工具调用未闭合时必须无条件撤回收尾倒计时）。 */
+  const clearSettle = (): void => {
+    if (settleTimer) clearTimeout(settleTimer);
+    settleTimer = null;
+  };
+
   const armIdle = (force = false): void => {
     if (settled || input.idleMs <= 0) return;
     const t = now();
     if (!force && idleTimer && t - idleArmedAt < rearmThreshold(input.idleMs)) return;
     if (idleTimer) clearTimeout(idleTimer);
     idleArmedAt = t;
-    idleTimer = setTimeout(() => triggerTimeout('idle_timeout'), input.idleMs);
+    idleTimer = setTimeout(() => {
+      if (settled || terminal) return;
+      // 仍有未闭合工具调用：stdout 静默是**预期内**的（例如前台 docker 构建正在跑），
+      // 不得据此判卡死；改为重新武装 idle，等待工具闭合或 hard 上限兜底。
+      if (openToolCalls > 0) {
+        if (!idleSuppressedLogged) {
+          idleSuppressedLogged = true;
+          const hardMin = Math.round(input.hardMs / 60_000);
+          input.onEvent(
+            'system',
+            `⏱ 空闲超时已推迟：仍有 ${openToolCalls} 个工具调用未返回（例如前台 docker 构建），` +
+              `静默属预期；${hardMin > 0 ? `${hardMin} 分钟硬上限仍有效` : '硬上限未启用'}`
+          );
+        }
+        armIdle(true);
+        return;
+      }
+      triggerTimeout('idle_timeout');
+    }, input.idleMs);
   };
 
   const armSettle = (force = false): void => {
-    if (settled || input.settleMs <= 0 || !sessionEnded) return;
+    // 工具调用未闭合时**绝不**起算收尾宽限：agent_end 只代表"本回合/本 run 不再有循环事件"，
+    // 不代表仍在跑的工具（如 detached 的 docker compose build）已经结束。
+    if (settled || input.settleMs <= 0 || !sessionEnded || openToolCalls > 0) return;
     const t = now();
     if (!force && settleTimer && t - settleArmedAt < rearmThreshold(input.settleMs)) return;
-    if (settleTimer) clearTimeout(settleTimer);
+    clearSettle();
     settleArmedAt = t;
     settleTimer = setTimeout(() => {
       if (settled || terminal) return;
@@ -1128,6 +1272,18 @@ export function createStageGuard(input: StageGuardInput): StageGuard {
       input.onEvent('system', '✓ 会话已结束但进程未自行退出，主动收尾并保存结果以释放资源');
       beginStop('settle_grace');
     }, input.settleMs);
+  };
+
+  /** 会话结束信号到达但仍有未闭合工具调用：撤回收尾倒计时并**只记一次**明确事件。 */
+  const deferSettleForOpenTools = (): void => {
+    clearSettle();
+    if (agentEndDeferredLogged) return;
+    agentEndDeferredLogged = true;
+    input.onEvent(
+      'system',
+      `⚠ 会话已结束但仍有 ${openToolCalls} 个工具调用未返回（例如前台 docker 构建）：已推迟收尾，` +
+        '待全部工具闭合后再起算收尾宽限'
+    );
   };
 
   function triggerTimeout(kind: 'hard_timeout' | 'idle_timeout'): void {
@@ -1222,6 +1378,22 @@ export function createStageGuard(input: StageGuardInput): StageGuard {
         /* 记事件失败不得影响结算 */
       }
     }
+    // 结算瞬间仍未闭合的工具调用数：> 0 说明终止范围有残余风险，
+    // 且"整棵树已停止"**不可**权威确认（Pi 的 bash 工具是 detached 的，不在 Pi 的进程组内）。
+    openToolCallsAtSettle = openToolCalls;
+    const stopConfirmed = stopState === 'stopped' && openToolCallsAtSettle === 0;
+    if (openToolCallsAtSettle > 0) {
+      try {
+        input.onEvent(
+          'error',
+          `⚠ 终止时仍有 ${openToolCallsAtSettle} 个工具调用未返回（例如 detached 的 docker 构建）：` +
+            '组终止只覆盖 Pi 自身进程组；Pi 收到 SIGTERM 后会自行 SIGKILL 其 tracked detached 子进程，' +
+            '但平台侧**无法**权威确认这些后代已停止（残余风险，需人工/后续探测确认）'
+        );
+      } catch {
+        /* 记事件失败不得影响结算 */
+      }
+    }
     result = {
       killed: legacy.killed,
       timedOut: legacy.timedOut,
@@ -1233,7 +1405,8 @@ export function createStageGuard(input: StageGuardInput): StageGuard {
       channel: input.channel,
       facts,
       decision,
-      stopConfirmed: stopState === 'stopped',
+      stopConfirmed,
+      openToolCallsAtSettle,
     };
     recordStopIfNeeded(facts, stopState);
     unregisterStage(input.projectId, input.runId);
@@ -1381,7 +1554,28 @@ export function createStageGuard(input: StageGuardInput): StageGuard {
     noteSessionEnd(): void {
       if (settled) return;
       sessionEnded = true;
+      // 仍有未闭合工具调用 ⇒ 推迟收尾（等工具返回后再起算宽限）。
+      if (openToolCalls > 0) {
+        deferSettleForOpenTools();
+        return;
+      }
       armSettle(true);
+    },
+
+    noteToolCalls(open: number): void {
+      if (settled) return;
+      const n = Number(open);
+      openToolCalls = Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+      if (openToolCalls > 0) {
+        // 工具未闭合：撤回收尾倒计时；若会话已结束则记一次"推迟收尾"。
+        if (sessionEnded) deferSettleForOpenTools();
+        else clearSettle();
+        return;
+      }
+      // 全部闭合：允许下一轮 episode 重新记事件，并在会话已结束时恢复正常收尾宽限。
+      agentEndDeferredLogged = false;
+      idleSuppressedLogged = false;
+      if (sessionEnded) armSettle(true);
     },
 
     requestStop(reason: StopReason): void {
@@ -1444,6 +1638,7 @@ export function placeholderStageResult(
     facts,
     decision: decideStage(facts),
     stopConfirmed: true,
+    openToolCallsAtSettle: 0,
   };
 }
 

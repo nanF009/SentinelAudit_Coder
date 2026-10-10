@@ -52,6 +52,7 @@ import { piSpawnEnv, buildAgentCliArgs, cleanupPromptFile } from './piResolver';
 import {
   createStageGuard,
   createTerminator,
+  createOpenToolCallTracker,
   decideAutoRepair,
   decideSubmit,
   issueSubmitToken,
@@ -259,6 +260,10 @@ function persistDiagnostic(
       exitSignal: r.facts.exitSignal,
       decision: r.decision,
       note: r.facts.note,
+      // 终止范围与残余风险：> 0 表示终止时仍有未闭合工具调用（例如 detached 的 docker 构建），
+      // 组终止覆盖不到这些后代，`stopConfirmed` 亦为 false。
+      openToolCallsAtSettle: r.openToolCallsAtSettle ?? 0,
+      stopConfirmed: r.stopConfirmed,
       stderrTail: String(r.stderrTail || '').slice(-2000),
       structured: r.structured ?? null,
       finalResult: typeof r.finalResult === 'string' ? r.finalResult.slice(-20000) : '',
@@ -1689,6 +1694,16 @@ function runPiStage(
     const MAX_JSON_LINE = 512 * 1024;
     const MAX_LINES_PER_TICK = 32;
     let stdoutDrainScheduled = false;
+    // —— M1：未闭合工具调用集合（每个 runPiStage 实例一个 ⇒ 按 runId 隔离）——
+    // 用 Pi 真实的 tool_execution_start / tool_execution_end + toolCallId 配对维护。
+    // 目的：`agent_end` 只代表"本 run 不再有循环事件"，不代表仍在跑的工具（例如 detached 的
+    // docker compose build）已经结束；未闭合期间不得因 stdout 静默而收尾/判卡死。
+    const toolCalls = createOpenToolCallTracker();
+    /** 集合有变化时才通知 guard（避免无谓重置计时器 ⇒ 无工具调用的通道行为逐字不变）。 */
+    const trackToolCalls = (obj: any): void => {
+      const obs = toolCalls.observe(obj);
+      if (obs.changed) guard.noteToolCalls(obs.open);
+    };
     const processStdoutLine = (line: string): void => {
       if (!line) return;
       const markSessionEnd = () => {
@@ -1718,6 +1733,9 @@ function runPiStage(
       } catch {
         return;
       }
+      // M1：先维护"未闭合工具调用"集合，再判会话结束 ——
+      // 顺序很关键：同一行若是 tool_execution_end，集合已闭合，紧随其后的 agent_end 才能正常起算收尾。
+      trackToolCalls(obj);
       if (obj.type === 'result') {
         if (typeof obj.result === 'string') {
           ingestAssistantText(obj.result);
@@ -9375,6 +9393,27 @@ async function finalizeHarnessEnvReady(projectId: string, codeDir: string): Prom
   );
 }
 
+/**
+ * M0：环境构建阶段的**可观测性与生命周期约束**（只追加到 env 通道实际下发的 prompt 上）。
+ *
+ * 背景：`docker compose build` 长时间无输出时，平台只能靠 stdout 判活；而 Agent 若把构建
+ * 后台化或与后续命令串成静默长链，就会让"构建仍在跑"表现为"阶段无输出"。
+ * M1（未闭合工具调用门控）才是生命周期的主修复，本段只是**辅助**改善可观测性。
+ * 不改 schema.ts 里的提示词模板，避免动到其它通道共用的文案。
+ */
+const ENV_BUILD_OBSERVABILITY_RULES = [
+  '',
+  '# 构建可观测性与生命周期约束（必须遵守）',
+  '1. `docker compose build` 必须**前台执行并等待其退出**；禁止 `&`、`nohup`、`setsid`、`disown` 等后台化方式。',
+  '2. 禁止把构建与大量后续命令串成一条长时间无输出的静默链；构建与后续步骤请拆成多次工具调用分别执行。',
+  '3. 构建必须使用可观测输出，例如 `docker compose build --progress=plain 2>&1`，',
+  '   并在开始与结束各输出一行明确的进度标记，保证构建期间持续有日志可观测。',
+  '4. 构建结束后必须立即采集**真实退出状态**与关键结果：',
+  '   `echo "build exit=$?"`，再用 `docker compose ps` / `docker images` 确认容器与镜像的实际状态，',
+  '   明确报告成功或失败；不要仅凭"命令没有报错"就认定构建成功。',
+  '',
+].join('\n');
+
 /** 并行预搭建靶机环境：搭建并核实就绪；仅当验证未排队/未运行时 stop 容器省资源。 */
 async function doPrebuildEnv(projectId: string): Promise<void> {
   const project = getProject(projectId);
@@ -9525,7 +9564,8 @@ async function doPrebuildEnv(projectId: string): Promise<void> {
     return runPiStage(
       projectId,
       codeDir,
-      buildEnvPrompt(codeDir, spec),
+      // M0：附加构建可观测性约束（前台执行 + 持续输出 + 采集真实退出状态）。
+      buildEnvPrompt(codeDir, spec) + ENV_BUILD_OBSERVABILITY_RULES,
       '{"type":"object"}',
       {
         channel: 'env',
