@@ -765,16 +765,40 @@ export function hasLiveStage(projectId: string): boolean {
   return false;
 }
 
-/** 强制结算某项目下全部未结算实例（runJob.finally / 回收器）。 */
-export function forceSettleProject(projectId: string, reason: StopReason): number {
-  let n = 0;
+/** forceSettleProject / forceSettleProjectAndWait 的通道过滤选项。 */
+export interface ForceSettleOptions {
+  /**
+   * 这些通道的未结算实例**不参与**结算。
+   * 典型：env 通道是独立生命周期（由 startNextEnv / doPrebuildEnv / stopEnvChannel 管理），
+   * 审计任务结束时（runner_exit）不应把它连同仍在进行的 docker compose build 一起 SIGTERM。
+   */
+  excludeChannels?: readonly StageChannel[];
+}
+
+/** 该项目下"参与结算"的未结算实例记录（按可选通道过滤后）。 */
+function unsettledRecords(
+  projectId: string,
+  exclude?: readonly StageChannel[]
+): { entry: RegistryEntry; guard: StageGuard }[] {
+  const out: { entry: RegistryEntry; guard: StageGuard }[] = [];
   for (const runId of activeRunIds(projectId)) {
     const rec = stageRegistry.get(registryKey(projectId, runId));
     if (!rec || rec.entry.settled) continue;
-    n += 1;
-    void rec.guard.forceSettle(reason);
+    if (exclude && exclude.includes(rec.entry.channel)) continue;
+    out.push(rec);
   }
-  return n;
+  return out;
+}
+
+/** 强制结算某项目下全部未结算实例（runJob.finally / 回收器）。 */
+export function forceSettleProject(
+  projectId: string,
+  reason: StopReason,
+  options?: ForceSettleOptions
+): number {
+  const recs = unsettledRecords(projectId, options?.excludeChannels);
+  for (const rec of recs) void rec.guard.forceSettle(reason);
+  return recs.length;
 }
 
 /**
@@ -785,14 +809,16 @@ export function forceSettleProject(projectId: string, reason: StopReason): numbe
 export async function forceSettleProjectAndWait(
   projectId: string,
   reason: StopReason,
+  options?: ForceSettleOptions,
   maxWaitMs = TERM_GRACE_MS + KILL_GRACE_MS + 1_000
 ): Promise<{ forced: number; remaining: number }> {
-  const forced = forceSettleProject(projectId, reason);
+  const exclude = options?.excludeChannels;
+  const forced = forceSettleProject(projectId, reason, options);
   const deadline = nowMs() + Math.max(0, maxWaitMs);
-  while (activeRunIds(projectId).length > 0 && nowMs() < deadline) {
+  while (unsettledRecords(projectId, exclude).length > 0 && nowMs() < deadline) {
     await sleep(50);
   }
-  return { forced, remaining: activeRunIds(projectId).length };
+  return { forced, remaining: unsettledRecords(projectId, exclude).length };
 }
 
 /* ---------- 阻断型 / 追踪型停止记录 ---------- */

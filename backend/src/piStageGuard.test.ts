@@ -721,6 +721,37 @@ test('forceSettleProject 精确结算该项目全部未结算实例', async () =
   assert.deepEqual(activeRunIds(PID), [], '结算后必须精确注销');
 });
 
+test('forceSettleProject 支持 excludeChannels：runner_exit 保留 env 通道', async () => {
+  const env = fixture({ runId: 'run_env', channel: 'env' });
+  const cv = fixture({ runId: 'run_cv', channel: 'codeverify' });
+  env.guard.markSpawned(env.child);
+  cv.guard.markSpawned(cv.child);
+
+  const n = forceSettleProject(PID, 'runner_exit', { excludeChannels: ['env'] });
+  assert.equal(n, 1, '只结算 1 个非 env 实例');
+  await cv.guard.done;
+  assert.equal(cv.guard.settled, true, 'codeverify 实例被结算');
+  assert.equal(env.guard.settled, false, 'env 实例不得被结算');
+  assert.equal(env.terminator.requests, 0, 'env 子进程不得收到 SIGTERM');
+  assert.equal(activeRunIds(PID).includes('run_env'), true, 'env runId 必须保留在登记表');
+  assert.equal(activeRunIds(PID).includes('run_cv'), false, 'codeverify runId 已注销');
+  await env.guard.forceSettle('runner_exit');
+});
+
+test('forceSettleProject 默认（不带 exclude）仍结算全部通道（reaper 场景含 env）', async () => {
+  const env = fixture({ runId: 'run_env', channel: 'env' });
+  const cv = fixture({ runId: 'run_cv', channel: 'codeverify' });
+  env.guard.markSpawned(env.child);
+  cv.guard.markSpawned(cv.child);
+
+  const n = forceSettleProject(PID, 'reaper');
+  assert.equal(n, 2);
+  await Promise.all([env.guard.done, cv.guard.done]);
+  assert.equal(env.guard.settled, true, 'reaper 场景 env 也要结算');
+  assert.equal(cv.guard.settled, true);
+  assert.deepEqual(activeRunIds(PID), [], '全部结算后精确注销');
+});
+
 test('只移除 guard 自己注册的监听器（不破坏外部监听器）', async () => {
   const f = fixture();
   let externalCalls = 0;

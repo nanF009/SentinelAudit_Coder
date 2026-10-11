@@ -8243,7 +8243,11 @@ async function runJob(job: Job): Promise<void> {
     runningKind.delete(job.id);
     // 精确结算该项目下全部未结算的阶段实例，并等待其收尾（有界）。
     // 原实现只 `mainStageResolvers.delete(job.id)`，会把多通道（multi）永不结算的 Promise 留下。
-    const settled = await forceSettleProjectAndWait(job.id, 'runner_exit');
+    // env 通道是独立生命周期（startNextEnv→doPrebuildEnv），审计/验证结束不得把它连带 SIGTERM，
+    // 否则会杀掉仍在进行的 docker compose build（见 finishAudit 后 awaitEnvBuildIdle 汇合逻辑）。
+    const settled = await forceSettleProjectAndWait(job.id, 'runner_exit', {
+      excludeChannels: ['env'],
+    });
     if (settled.forced > 0 || settled.remaining > 0) {
       recordEvent(job.id, {
         kind: 'system',
