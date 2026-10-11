@@ -9558,6 +9558,10 @@ const ENV_BUILD_OBSERVABILITY_RULES = [
   '4. 构建结束后必须立即采集**真实退出状态**与关键结果：',
   '   `echo "build exit=$?"`，再用 `docker compose ps` / `docker images` 确认容器与镜像的实际状态，',
   '   明确报告成功或失败；不要仅凭"命令没有报错"就认定构建成功。',
+  '5. 若基础镜像是 Debian 系（php / apache / node 等官方镜像），生成 Dockerfile 时必须**优先把容器内 apt 源换成国内镜像**再执行 apt-get update/install，',
+  '   避免 deb.debian.org 网络抖动导致构建反复失败；例如：',
+  '   `sed -i "s|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g" /etc/apt/sources.list.d/debian.sources`',
+  '   （备选：mirrors.ustc.edu.cn / mirrors.aliyun.com）。',
   '',
 ].join('\n');
 
