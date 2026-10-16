@@ -157,7 +157,7 @@ export default function Layout() {
           {collapsed ? '»' : '«'}
         </button>
 
-        <div className="logo" title="StrikeAgent_Coder-Flash · 代码审计">
+        <div className="logo" title="SentinelAudit_Coder · 代码审计">
           <img
             className="logo-mark"
             src="/brand-mark.png"
@@ -168,8 +168,8 @@ export default function Layout() {
           />
           <div className="logo-text">
             <strong className="logo-name">
-              <span>StrikeAgent_</span>
-              <span>Coder-Flash</span>
+              <span>SentinelAudit_</span>
+              <span>Coder</span>
             </strong>
             <span className="logo-tag">代码审计</span>
           </div>

@@ -1,5 +1,16 @@
-StrikeAgent_Coder-Flash
-Copyright (c) 2026 夜安团队 SEC
+SentinelAudit_Coder
+Copyright (c) 2026 SentinelAudit_Coder contributors
+
+This project is a derivative work based on:
+
+    StrikeAgent_Coder-Flash
+    Copyright (c) 2026 夜安团队 SEC
+    https://github.com/Yean-Sec/StrikeAgent_Coder-Flash
+
+SentinelAudit_Coder is a secondary-development (二开) fork of
+StrikeAgent_Coder-Flash. The original code is not claimed as original
+work of the SentinelAudit_Coder contributors; upstream copyright and
+attribution are preserved above.
 
 SPDX-License-Identifier: AGPL-3.0-only
 
@@ -7,5 +18,6 @@ Personal and open-source use is free under the GNU Affero General
 Public License v3.0 only. See LICENSE.
 
 Commercial / proprietary licensing (closed-source, SaaS, or any use
-that cannot or will not meet AGPL source obligations):
+that cannot or will not meet AGPL source obligations) must be obtained
+from the upstream copyright holder (夜安团队 SEC):
 gavenmiya@outlook.com

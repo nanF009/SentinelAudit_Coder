@@ -1,107 +1,70 @@
-<p align="center">
-  <img src="docs/assets/header-icon.png" width="128" height="128" alt="StrikeAgent" />
-  <img src="docs/assets/times.svg" width="48" height="128" alt="×" />
-  <img src="docs/assets/header-brand.png" width="128" height="128" alt="夜安团队 SEC" />
-</p>
+<h1 align="center">SentinelAudit_Coder</h1>
 
 <p align="center">
-  <sub>StrikeAgent × 夜安团队 SEC</sub>
+  <sub>基于本地 Pi 的图形化代码审计与自动化漏洞验证控制台 · v0.1.0</sub>
 </p>
 
-<h1 align="center">StrikeAgent_Coder-Flash</h1>
+> **项目定位**：SentinelAudit_Coder 是基于 [StrikeAgent_Coder-Flash](https://github.com/Yean-Sec/StrikeAgent_Coder-Flash)（原项目，夜安团队 SEC）的**二次开发版本**。
+>
+> 本仓库在保留原项目核心审计能力的基础上，针对 Pi 生命周期稳定性、靶机（env）搭建可靠性、验证闭环与结构化报告做了增强与修复。
 
-![StrikeAgent_Coder-Flash 架构](docs/assets/main.gif)
+---
 
-此项目由夜安团队历时四个月研发而成，经团队多位代码领域专家细心调教，Flash 由 Pro 版简化而来，也达到了 Pro 版约五分之一的检出能力，实现了从源代码到真正可利用漏洞的完整链路，希望能成为同类项目的替代方案。研发过程中，团队经历了模型训练、代码切块向量化、机器筛选污点链到审计、AI筛选污点链到AI审计等一系列创新方案，最终选择了目前这套方案(多智能体审计+代码级验证+红队二次验证+自动化靶机搭建验证+漏洞组合利用)，希望在效果和价格之间取得平衡。
+## 项目来源 / Upstream
 
-## 架构
+- **原项目**：[Yean-Sec / StrikeAgent_Coder-Flash](https://github.com/Yean-Sec/StrikeAgent_Coder-Flash)
+- **原作者**：夜安团队 SEC
+- **License**：AGPL-3.0-only（本二开项目同样遵循，详见 [License](#license)）
 
-控制台调度审计与验证。全量审计是每语言 4 路专项 Pi 并发，由后端收口（不再另拉主控轮询）；去重、代码级验证、红队二次评级共用工人池（每路 10 条、最多 10 路）。走完这四关后，在 Compose 完整 HTTP 靶机上打单洞、拼组合链。验证可以和审计并行预搭建靶机，但不走最小运行时。
+本项目的代码大量继承自原项目，在此对原项目及其作者致以诚挚感谢。
 
-![StrikeAgent_Coder-Flash 架构](docs/assets/architecture.png)
+---
 
-## 产品页面展示
+## 二开内容（相对 upstream）
 
-审计列表：全部项目的进度、漏洞计数与耗时。
+在 `feature/security-report-platform` 分支上，本版本相对 upstream 基线（`5fb788e`）累计 13 个提交，主要包含两类工作：
 
-![审计列表](docs/assets/ScreenShot_2026-09-14_213300_325.png)
+**稳定性 / 生命周期增强**
+- Pi 阶段生命周期增强（`piStageGuard` 门控逻辑：未闭合工具调用追踪、收尾推迟、hard 上限）。
+- 修复 audit finalization 时 env 通道被误 SIGTERM 清理的问题（`forceSettleProject` 支持 `excludeChannels: ['env']`）。
+- 修复 env 预搭建被过早终止、验证入队被 env 失败阻断未记账等问题。
+- env Dockerfile 构建可靠性增强：Debian 系基础镜像强制替换国内 apt 镜像源，避免 `deb.debian.org` 网络抖动导致构建反复失败。
+- 修复 SQLite busy 时事件落库崩溃、子智能体 JSON 落盘契约不严等问题。
 
-项目详情：代码审计与靶机验证流水线、分环节续跑。
+**结构化报告基础设施**
+- vulnerabilities 表与类型新增 `root_cause` / `endpoint` / `exploitation` / `payload` 四个结构化字段，并完成 DB / API / 前端（漏洞详情页、报告 HTML/Markdown）渲染。
+- HTTP evidence / POC / exploit report / 验证记录归档能力（`_remote_verify` 产物、`exploit_report` 结构化报告、验证账本）。
 
-![项目详情](docs/assets/ScreenShot_2026-09-14_213338_727.png)
+> 以上改动已通过 YikaiCMS 真实审计 Benchmark 验证（见 [Benchmark 基线](#benchmark-基线)）。
 
-单个漏洞详情：评级、问题描述与污点链。
+---
 
-![漏洞详情](docs/assets/ScreenShot_2026-09-14_213920_710.png)
+## 核心架构概述
 
-## 交付报告
+控制台调度审计与验证。全量审计是每语言 4 路专项 Pi 并发，由后端收口；去重、代码级验证、红队二次评级共用工人池。走完这些关卡后，在 Docker Compose 完整 HTTP 靶机上做单漏洞验证与组合链验证。验证可与审计并行预搭建靶机。
 
-*此报告为一次真实的授权审计场景*
-
-![安全审计报告](docs/assets/ScreenShot_2026-09-14_210619_629.png)
-
-## 环境与安装说明
-
-
-
-### Agent 部署提示词
-
-把下面整段连同源代码交给任意能跑本机命令的 AI。它应按原文把控制台搭起来，不要把路径写死成别人的机器。
+完整闭环：
 
 ```
-你要在本机把 StrikeAgent_Coder-Flash 从当前源代码部署到可打开的代码审计控制台。目标系统是 Kali / Debian 系 Linux（有 Node、能装全局 npm 包、能跑 Docker、有 systemd 可 sudo）。不要用 Docker 当本控制台的主路径（控制台是 Node 前后端；Docker 只给「远程验证」拉靶机用）。不要把任何路径写死成 /home/kali/桌面/... 或其它克隆者机器上的目录。
-
-一、目录与进程纪律
-- 仓库根记为 REPO（含 backend/、frontend/、docs/、根 package.json 的 npm workspaces）。
-- 控制台默认：后端 :8787，前端 :5302（Vite 把 /api 和 /ws 代理到 8787）。局域网要打开时 BIND_HOST=0.0.0.0。
-- 长期部署必须走守护，不要用前台 npm run dev：终端一关或后端卡死就不会回来；tsx watch 改源码还会掐断审计。
-- 生产单端口：npm run start:web 先构建 frontend/dist，再由后端（supervisor）同端口 8787 托管 SPA。不要同时再起一份 Vite。
-- 数据、库、工作区、上传只写 backend/data/、backend/workspace/、backend/uploads/（已 gitignore）。不要提交 .env、*.db、workspace、data。
-- 8787 已被占用 = 已有后端在跑。不要再起第二个后端，否则会双开 Pi、把同一项目跑乱。先 curl 探活，活着就复用。
-
-二、依赖
-- Node.js 18+、npm。系统包：sudo apt 安装 nodejs npm build-essential python3 curl git docker.io docker-compose-plugin（或 docker-compose）。当前用户要进 docker 组，docker ps 能跑，远程验证才能拉 Compose 完整 HTTP 靶机。
-- 在 REPO 执行：npm run install:all（会 rebuild backend 的 better-sqlite3）。不要只装 frontend 或只装 backend。
-- 全局安装 Pi：npm install -g --ignore-scripts @earendil-works/pi-coding-agent。本机 `pi --version` 必须能跑。
-- 密钥给 Pi 用，不要写进仓库。需要 DEEPSEEK_API_KEY，或 ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY（也可配在 ~/.pi/agent/settings.json 的 env）。设置页里「Pi 可执行文件」对应库键 claude_path，空则自动解析全局 pi。把当前 shell 里的 DEEPSEEK_* / ANTHROPIC_* / PI_* 准备好后再 sudo scripts/code-up.sh（会快照到 backend/data/code-agent.env，权限 600）。
-- 默认审计命令形态是：pi --mode json --no-session --no-context-files --provider anthropic {prompt}。不要改回 claude CLI，Flash 版引擎是 Pi。
-
-三、启动（常驻，推荐）
-- 有 systemd（默认）：把密钥 export 好后执行
-  cd $REPO && sudo bash scripts/code-up.sh
-  这会安装 code-flash-backend / code-flash-frontend 两个 unit：后端走 supervisor.mjs（/api/health 连续失败约数秒内 SIGKILL 并拉起；unit 自身 Restart=always），前端 Vite 崩溃也会自动重启。
-- 无 systemd / 不能 sudo：
-  cd $REPO && BIND_HOST=0.0.0.0 bash scripts/code-daemon.sh start
-- 仅改代码调试（会热重载、关终端即停，不要当部署）：
-  cd $REPO && BIND_HOST=0.0.0.0 PORT=8787 BACKEND_PORT=8787 FRONTEND_PORT=5302 npm run dev
-- 生产单端口：
-  cd $REPO && BIND_HOST=0.0.0.0 PORT=8787 npm run start:web
-- 不要在临时 shell 里再起 npm --workspace backend run dev / tsx src/index.ts，会和守护抢端口、重复派 Pi。
-
-四、验收
-curl -sS http://127.0.0.1:8787/api/health          期望 {"ok":true,...}
-curl -sS http://127.0.0.1:8787/api/pi/health       期望能解析到本机 pi（未装 Pi 会提示 npm install -g --ignore-scripts @earendil-works/pi-coding-agent）
-常驻 / 开发：http://127.0.0.1:5302/   （局域网用本机 IP:5302）
-生产单端口：http://127.0.0.1:8787/
-失败先看：sudo scripts/code-backend.sh status / sudo journalctl -u code-flash-backend -n 80；或 backend/data/logs/ 与 backend/data/supervisor.log。缺 native 模块则在 REPO 再 npm run install:all；8787 占用则不要再起后端；pi 找不到就按上面全局安装并确认密钥。
+代码审计 → env 靶机搭建 → verify 漏洞验证 → 结果归档（JSON / Markdown / POC / HTTP evidence / exploit report）
 ```
 
+![SentinelAudit_Coder 架构](docs/assets/architecture.png)
 
+---
 
-### 环境
+## 安装要求
 
-建议在 **Kali Linux** 上跑（远程验证要调本机 Docker）。其它 Debian / Ubuntu 也能起控制台，但 Compose 靶机不一定齐。
+建议在 **Kali Linux** 上运行（远程验证需要调用本机 Docker）。其它 Debian / Ubuntu 也能启动控制台，但 Compose 靶机不一定齐全。
 
-
-| 依赖            | 版本 / 说明                                                                                      |
-| ------------- | -------------------------------------------------------------------------------------------- |
-| 系统            | Kali / Debian 系，systemd，能 `sudo`（长期部署走 `scripts/code-up.sh`）                            |
-| Node.js / npm | **18+**                                                                                      |
-| Pi            | 本机 `pi` 能用：`npm i -g --ignore-scripts @earendil-works/pi-coding-agent`，配好 `DEEPSEEK_API_KEY` |
-| Docker        | 当前用户能 `docker ps`；远程验证拉 Compose 完整 HTTP 靶机                                                   |
-| 端口            | 开发 **5302** 控制台、**8787** API；生产只开 **8787**                                                   |
-| 磁盘            | `backend/data/`、`backend/workspace/`、`backend/uploads/` 会写库与工作区，已 gitignore                  |
-
+| 依赖 | 版本 / 说明 |
+| --- | --- |
+| 系统 | Kali / Debian 系，systemd，可 `sudo` |
+| Node.js / npm | 18+ |
+| Pi | `npm i -g --ignore-scripts @earendil-works/pi-coding-agent`，并配置 `DEEPSEEK_API_KEY` |
+| Docker | 当前用户可执行 `docker ps`；远程验证拉取 Compose 完整 HTTP 靶机 |
+| 端口 | 开发：5302 控制台 / 8787 API；生产：仅 8787 |
+| 磁盘 | `backend/data/`、`backend/workspace/`、`backend/uploads/`（已 gitignore） |
 
 系统包（Kali / Debian）：
 
@@ -118,23 +81,21 @@ sudo npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 pi --version
 ```
 
-模型密钥用环境变量即可，不要写进仓库：
+模型密钥使用环境变量，**不要写进仓库**：
 
-
-| 变量                     | 作用              |
-| ---------------------- | --------------- |
-| `DEEPSEEK_API_KEY`     | 大模型密钥           |
+| 变量 | 作用 |
+| --- | --- |
+| `DEEPSEEK_API_KEY` | 大模型密钥 |
 | `ANTHROPIC_AUTH_TOKEN` | 密钥别名（有则自动填给 Pi） |
-| `ANTHROPIC_API_KEY`    | 同上              |
+| `ANTHROPIC_API_KEY` | 同上 |
 
+---
 
-
-
-### 安装
+## 部署 / 运行方法
 
 ```bash
 git clone <本仓库 URL>
-cd StrikeAgent-Coder-Flash
+cd SentinelAudit_Coder
 npm run install:all
 ```
 
@@ -145,7 +106,7 @@ npm run install:all
 sudo bash scripts/code-up.sh
 ```
 
-浏览器打开 **[http://127.0.0.1:5302/](http://127.0.0.1:5302/)**。局域网其它机器用 `http://<kali-ip>:5302/`。
+浏览器打开 **http://127.0.0.1:5302/**（局域网其它机器用 `http://<kali-ip>:5302/`）。
 
 无 systemd 时：`bash scripts/code-daemon.sh start`。
 
@@ -161,35 +122,72 @@ BIND_HOST=0.0.0.0 PORT=8787 BACKEND_PORT=8787 FRONTEND_PORT=5302 npm run dev
 BIND_HOST=0.0.0.0 PORT=8787 npm run start:web
 ```
 
-浏览器打开 **[http://127.0.0.1:8787/](http://127.0.0.1:8787/)**。
-
 确认起来：
 
 ```bash
-curl -sS http://127.0.0.1:8787/api/health
-# 期望含 "ok": true
-
-sudo bash scripts/code-backend.sh status
-
-curl -sS http://127.0.0.1:8787/api/pi/health
-# 期望能解析到本机 pi
+curl -sS http://127.0.0.1:8787/api/health   # 期望含 "ok": true
+curl -sS http://127.0.0.1:8787/api/pi/health # 期望能解析到本机 pi
 ```
 
-数据在 `backend/data/`、`backend/workspace/`、`backend/uploads/`，已进 `.gitignore`。
+数据写入 `backend/data/`、`backend/workspace/`、`backend/uploads/`，均已 gitignore。
 
-## 开源协议与免责声明
+---
 
-**AGPL-3.0-only** — 个人和开源使用免费。商业许可请联系 [gavenmiya@outlook.com](mailto:gavenmiya@outlook.com)。
+## 基本使用流程
 
-本仓库默认按 [GNU Affero General Public License v3.0](LICENSE)（仅第 3 版，不含后续版本）开源：
+1. 在控制台新建审计项目，上传/指定目标源码（或 clone 目标仓库）。
+2. 后端按语言派发多路 Pi 子智能体并行审计，收口后去重、代码级验证、红队二次评级。
+3. 审计期间（或审计后）自动搭建 Compose 靶机环境。
+4. 对中高危漏洞执行远程验证，产出单漏洞结论与组合链结论。
+5. 结果归档为 JSON / Markdown 漏洞报告 / POC / HTTP evidence / 结构化 exploit report，可在项目详情页与漏洞详情页查看。
 
-- **个人 / 开源（免费）：** 可复制、修改、分发；通过网络提供服务时，必须向用户提供完整对应源代码，并以 AGPL-3.0-only 再许可。
-- **商业许可：** 闭源修改、专有产品、SaaS，或无法 / 不愿履行 AGPL 源代码义务的部署，须向夜安团队 SEC 取得单独商业许可。联系：**gavenmiya@outlook.com**
+---
 
-AGPL 正文见 [LICENSE](LICENSE)。商业许可条款以邮件约定为准。
+## 当前版本
 
-本软件仅限在已获明确授权的环境中使用。使用即表示你已获得目标环境的授权，并自行承担合规与后果。作者与夜安团队 SEC 不对滥用、数据损坏或法律纠纷负责。
+**v0.1.0** —— 第一阶段封版基线（发布整理中）。
 
-交流群目前已满。关注公众号「夜安团队SEC」，联系我们拉进群。
+---
 
-![夜安团队SEC 公众号名片](docs/assets/wechat-oa.png)
+## Benchmark 基线
+
+以下为同一份 YikaiCMS 源码（yikaicms-GF-v2.0.6）在 upstream 与 SentinelAudit_Coder 上的实测对比：
+
+| 指标 | Upstream（原项目） | SentinelAudit_Coder |
+| --- | --- | --- |
+| 审计耗时 | ≈ 19.6 min | ≈ 11.7 min |
+| verify 耗时 | ≈ 48.8 min | ≈ 9.1 min |
+| 总漏洞 | 15 | 12 |
+| High | 2 | 0 |
+| Medium | 7 | 4 |
+| Low | 5 | 7 |
+| Info | 1 | 1 |
+| verified | 9 | 4 |
+
+> ⚠️ **重要说明**：该 Benchmark 仅代表当前 v0.1.0 基线。SentinelAudit_Coder 在**漏洞发现数量上并未超过 upstream**（本次漏洞数与高危数均低于 upstream）。本版本的收益主要体现在 **env/Docker 稳定性、verify 效率、完整闭环可靠性**，而非检出率。
+
+---
+
+## 已知问题
+
+1. **漏洞发现数量在 YikaiCMS Benchmark 中低于 upstream**（12 vs 15，且 High 0 vs 2）。
+2. **verifier 对部分 authenticated / admin RCE 存在假阴性**（判定过于保守，把真实高危漏洞判为 design_decision 而漏报）。
+3. **`root_cause` / `endpoint` / `exploitation` / `payload` 已建立 schema / DB / UI 支持，但当前 Benchmark 中尚未稳定自动填充**。
+4. **Security Skill / 专项 Agent / 更高级攻击链推理属于后续版本规划**，尚未实现。
+
+---
+
+## License
+
+本项目基于原项目二次开发，遵循 **AGPL-3.0-only**（GNU Affero General Public License v3.0，仅第 3 版）。
+
+- **个人 / 开源（免费）**：可复制、修改、分发；通过网络提供服务时，必须向用户提供完整对应源代码，并以 AGPL-3.0-only 再许可。
+- **商业许可**：闭源修改、专有产品、SaaS，或无法 / 不愿履行 AGPL 源代码义务的部署，须向**原项目版权方（夜安团队 SEC）**取得单独商业许可。
+
+原项目版权声明保留于 [NOTICE](NOTICE) 与 [LICENSE](LICENSE)。本项目不声称原项目代码为二次开发者原创。
+
+---
+
+## 安全 / 使用说明
+
+本软件仅限在**已获明确授权**的环境中用于代码审计与安全测试。使用即表示你已获得目标环境的授权，并自行承担合规与后果。原项目作者、夜安团队 SEC 及本项目二次开发者均不对滥用、数据损坏或法律纠纷负责。

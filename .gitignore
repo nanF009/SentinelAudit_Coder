@@ -38,3 +38,6 @@ chat_xss.png
 .DS_Store
 *.local
 *.log
+
+# WorkBuddy 工作区数据（本机助手记忆/内部验证报告，不提交）
+.workbuddy/

@@ -22,6 +22,7 @@ const base = String(te.url || `http://localhost:${portOverride || 80}`).replace(
 const u = new URL(base);
 const port = u.port || (u.protocol === 'https:' ? 443 : 80);
 const accounts = Array.isArray(te.accounts) ? te.accounts : te.accounts ? Object.entries(te.accounts).map(([role, v]) => ({ role, ...(typeof v === 'object' ? v : { username: String(v) }) })) : [];
+// 注：以下 admin/admin123、user/user123 仅为测试靶机未提供账号时的 fallback 默认凭据，非任何真实系统凭据。
 const adminAcct = accounts.find((a) => a.role === 'admin') || { username: 'admin', password: 'admin123' };
 const userAcct = accounts.find((a) => a.role === 'user' || a.role === 'guest') || { username: 'user', password: 'user123' };
 
