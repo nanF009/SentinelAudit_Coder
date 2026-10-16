@@ -237,7 +237,7 @@ test('M-A：全部 restricted 时进度为 concluded、pending=0', () => {
 test('M-A：收尾不改项目级 verify_status 与原有错误记录', () => {
   const projectId = uid('p_ledger_project');
   runInRollback(() => {
-    // 复刻 YikaiCMS 现场：项目级已判 failed 并带原有错误文案
+    // 复刻项目级 env 失败现场：项目级已判 failed 并带原有错误文案
     insertProject(projectId, { verify_status: 'failed', env_status: 'failed' });
     db.prepare('UPDATE projects SET verify_error = ? WHERE id = ?').run(
       '靶机环境搭建失败，未进行远程验证',
@@ -263,7 +263,7 @@ test('M-A：收尾不改项目级 verify_status 与原有错误记录', () => {
 test('M-B：工作区/源码包缺失时 /verify 返回明确原因，而非"已在运行或排队中"', () => {
   const projectId = uid('p_reject_ws');
   runInRollback(() => {
-    // 复刻 YikaiCMS 现场：审计完成、验证 failed、源码与工作区已被清理
+    // 复刻项目清理后的失败现场：审计完成、验证 failed、源码与工作区已被清理
     insertProject(projectId, { verify_status: 'failed', env_status: 'failed', workspace_path: null });
     seedProject(projectId);
 
