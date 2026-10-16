@@ -35,8 +35,6 @@
 - vulnerabilities 表与类型新增 `root_cause` / `endpoint` / `exploitation` / `payload` 四个结构化字段，并完成 DB / API / 前端（漏洞详情页、报告 HTML/Markdown）渲染。
 - HTTP evidence / POC / exploit report / 验证记录归档能力（`_remote_verify` 产物、`exploit_report` 结构化报告、验证账本）。
 
-> 以上改动已通过 YikaiCMS 真实审计 Benchmark 验证（见 [Benchmark 基线](#benchmark-基线)）。
-
 ---
 
 ## 核心架构概述
@@ -149,30 +147,27 @@ curl -sS http://127.0.0.1:8787/api/pi/health # 期望能解析到本机 pi
 
 ---
 
-## Benchmark 基线
+## 研发测试 / 能力基线
 
-以下为同一份 YikaiCMS 源码（yikaicms-GF-v2.0.6）在 upstream 与 SentinelAudit_Coder 上的实测对比：
+本版本在开发与自测过程中，围绕以下方面进行了验证（不含任何第三方具体目标的测试细节）：
 
-| 指标 | Upstream（原项目） | SentinelAudit_Coder |
-| --- | --- | --- |
-| 审计耗时 | ≈ 19.6 min | ≈ 11.7 min |
-| verify 耗时 | ≈ 48.8 min | ≈ 9.1 min |
-| 总漏洞 | 15 | 12 |
-| High | 2 | 0 |
-| Medium | 7 | 4 |
-| Low | 5 | 7 |
-| Info | 1 | 1 |
-| verified | 9 | 4 |
+- **审计流程完整性**：从源码输入到多路子智能体审计、去重、代码级验证、红队二次评级，流程可完整走通。
+- **Docker / env 环境构建稳定性**：Debian 系基础镜像在受限网络下仍可稳定完成靶机构建。
+- **自动漏洞验证流程**：对中高危发现可自动进入远程验证，产出单漏洞结论与组合链结论。
+- **HTTP 证据采集**：验证过程中采集 HTTP 请求 / 响应证据并归档。
+- **结构化漏洞报告**：支持根因 / 入口 / 利用方式 / Payload 等结构化字段的落库与渲染。
+- **audit → env → verify → report 完整闭环**：全流程可端到端跑通并产出归档结果。
+- **验证流程效率与稳定性**：验证阶段在复用靶机、减少重复构建上做了优化。
 
-> ⚠️ **重要说明**：该 Benchmark 仅代表当前 v0.1.0 基线。SentinelAudit_Coder 在**漏洞发现数量上并未超过 upstream**（本次漏洞数与高危数均低于 upstream）。本版本的收益主要体现在 **env/Docker 稳定性、verify 效率、完整闭环可靠性**，而非检出率。
+> 上述能力基线仅用于说明本版本自身已具备的工程能力，不代表在漏洞发现能力上已经超越原项目。漏洞发现能力仍在持续优化中。
 
 ---
 
 ## 已知问题
 
-1. **漏洞发现数量在 YikaiCMS Benchmark 中低于 upstream**（12 vs 15，且 High 0 vs 2）。
-2. **verifier 对部分 authenticated / admin RCE 存在假阴性**（判定过于保守，把真实高危漏洞判为 design_decision 而漏报）。
-3. **`root_cause` / `endpoint` / `exploitation` / `payload` 已建立 schema / DB / UI 支持，但当前 Benchmark 中尚未稳定自动填充**。
+1. **漏洞发现能力仍在持续优化**：当前版本的检出能力尚未达到理想水平，后续会继续调优审计与判定策略。
+2. **verifier 对部分 authenticated / admin 场景的判定仍可能偏保守**，存在把部分真实风险判为设计行为而漏报的情况。
+3. **部分结构化漏洞字段目前尚未完全自动填充**：`root_cause` / `endpoint` / `exploitation` / `payload` 已完成 schema / DB / UI 支持，但自动填充率仍有待提升。
 4. **Security Skill / 专项 Agent / 更高级攻击链推理属于后续版本规划**，尚未实现。
 
 ---
