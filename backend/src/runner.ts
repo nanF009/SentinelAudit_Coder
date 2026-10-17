@@ -4359,14 +4359,13 @@ async function isTargetFullyReady(projectId: string, codeDir: string): Promise<b
   if (harnessMode) return isHarnessEnvReady(codeDir);
   if (isExternallyManagedTarget(codeDir)) {
     // external 也允许多 URL（含 version proof），避免首页冷启动挂起被误判不可达。
-    return !!(await anyTargetUrlReachable(projectId, codeDir));
+    return !!(await anyTargetUrlReachable(projectId, codeDir, { reject5xx: true }));
   }
   if (!(await dockerAvailable())) return false;
   const projName = composeProjectName(projectId);
   if (!(await targetRunning(projName))) return false;
-  // 与冷启动软就绪一致：任一探测 URL 可达即可（XWiki 首页冷启动时常超时，但
-  // /.strikeagent-version 已由网关直接 200）。
-  return !!(await anyTargetUrlReachable(projectId, codeDir));
+  // 严格就绪：任一探测 URL 可达（含 version proof / 登录页），但 5xx 视为未就绪。
+  return !!(await anyTargetUrlReachable(projectId, codeDir, { reject5xx: true }));
 }
 
 /** 是否有在途的靶机搭建（内存队列 / Pi Agent 进程 / envTasks）。 */
@@ -4913,12 +4912,17 @@ function collectTargetProbeUrls(projectId: string, codeDir: string): string[] {
   return urls;
 }
 
-/** 任一探测 URL 可达即视为 HTTP 面起来（含 401/403/302）；并行探测，避免慢 URL 拖死。 */
-async function anyTargetUrlReachable(projectId: string, codeDir: string): Promise<string | null> {
+/** 任一探测 URL 可达即视为 HTTP 面起来（含 401/403/302）；并行探测，避免慢 URL 拖死。
+ *  `opts.reject5xx` 透传给底层探测：严格模式下 5xx 不算可达，其余 URL 仍参与判断。 */
+export async function anyTargetUrlReachable(
+  projectId: string,
+  codeDir: string,
+  opts: { reject5xx?: boolean } = {}
+): Promise<string | null> {
   const urls = collectTargetProbeUrls(projectId, codeDir);
   if (urls.length === 0) return null;
   const hits = await Promise.all(
-    urls.map(async (url) => ((await urlReachable(url, TARGET_PROBE_TIMEOUT_MS)) ? url : null))
+    urls.map(async (url) => ((await urlReachable(url, TARGET_PROBE_TIMEOUT_MS, opts)) ? url : null))
   );
   return hits.find((u) => !!u) || null;
 }
@@ -5126,7 +5130,7 @@ async function ensureTargetUp(projectId: string, codeDir: string): Promise<boole
   // external：Cursor Agent 自建靶机，只认 URL 可达，禁止产品搭环境
   if (isExternallyManagedTarget(codeDir)) {
     const url = resolveTargetUrl(projectId, codeDir);
-    if (await urlReachable(url)) {
+    if (await urlReachable(url, 8000, { reject5xx: true })) {
       setEnvStatus(projectId, 'ready', url);
       syncRegistrationMeta(projectId, codeDir);
       recordEvent(
@@ -5601,7 +5605,7 @@ async function doVerify(projectId: string, resume = false): Promise<void> {
           ep.workspace_path && fs.existsSync(ep.workspace_path) ? ep.workspace_path : '';
         const external = wsHint ? isExternallyManagedTarget(wsHint) : false;
         const owned = external ? true : await targetRunning(composeProjectName(projectId));
-        const reachable = cleanUrl ? await urlReachable(cleanUrl) : false;
+        const reachable = cleanUrl ? await urlReachable(cleanUrl, 8000, { reject5xx: true }) : false;
         const ok = external
           ? !!(cleanUrl && reachable)
           : owned && (cleanUrl ? reachable : true);
@@ -9271,8 +9275,15 @@ function extractTargetUrl(text: string): string | null {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** 探测靶机地址是否可达（任何 HTTP 响应都算可达，含 401/403/302）。 */
-function urlReachable(rawUrl: string, timeoutMs = 8000): Promise<boolean> {
+/** 探测靶机地址是否可达（任何 HTTP 响应都算可达，含 401/403/302）。
+ *  `opts.reject5xx` 开启后，5xx 视为「应用不健康」返回 false；
+ *  2xx / 3xx / 4xx（如 401/403/404）仍算可达。默认关闭，保持旧语义。
+ *  状态码缺失或异常（<100）时一律视为不可达，避免因默认值/比较误判成功。 */
+export function urlReachable(
+  rawUrl: string,
+  timeoutMs = 8000,
+  opts: { reject5xx?: boolean } = {}
+): Promise<boolean> {
   return new Promise((resolve) => {
     let done = false;
     let req: http.ClientRequest | null = null;
@@ -9298,7 +9309,11 @@ function urlReachable(rawUrl: string, timeoutMs = 8000): Promise<boolean> {
         (res) => {
           res.resume();
           clearTimeout(wall);
-          finish(true);
+          // 严格模式：只有 1xx~4xx 才算可达，5xx 及以上判为应用不健康；
+          // 缺省/异常状态码（<100）安全判为不可达。
+          const code = res.statusCode ?? 0;
+          const ok = opts.reject5xx ? code >= 100 && code < 500 : true;
+          finish(ok);
         }
       );
       req.on('error', () => {
@@ -9452,7 +9467,7 @@ async function finalizeWebEnvReady(
   let reachable = false;
   if (url) {
     for (let i = 0; i < 3 && !reachable; i++) {
-      reachable = await urlReachable(url);
+      reachable = await urlReachable(url, 8000, { reject5xx: true });
       if (!reachable) await sleep(4000);
     }
   }
