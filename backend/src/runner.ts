@@ -2843,7 +2843,26 @@ async function codeVerifyFindings(
       return;
     }
     const verdict = String(rt.verdict || '').toLowerCase();
-    if (verdict && !keep.has(verdict)) return; // 明确判为误报/设计决策才剔除
+    if (verdict && !keep.has(verdict)) {
+      // 可追溯性：记录被代码级验证过滤的候选（仅审计日志，不进正式漏洞报告）。
+      // 只写标题/文件:行/verdict/简短 reason，不含 payload、密钥或源码内容。
+      // recordEvent → persistEvent → flushBufferedEvents 内部已 try/catch 兜底（失败只回填重试），不会抛出。
+      const fPath = String(v.file || v.file_path || '');
+      recordEvent(
+        projectId,
+        {
+          kind: 'system',
+          agent: '验证组',
+          tool: '',
+          text: `↪ 代码级验证过滤（${verdict}）：${String(v.title || '')}${
+            fPath ? ` @ ${fPath}${v.line ? ':' + v.line : ''}` : ''
+          } —— ${String(rt.reason || '').slice(0, 200)}`,
+        },
+        true,
+        'audit'
+      );
+      return; // 明确判为误报/设计决策才剔除
+    }
     const vs = String(rt.verified_severity || '').toLowerCase();
     const nextSev = validSev.has(vs) ? vs : String(v.severity || 'info').toLowerCase();
     const entry: any = {

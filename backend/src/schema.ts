@@ -1188,7 +1188,7 @@ ${groupFile}
 核完后把结果写入 \`${outFile}\`，内容是**严格合法 JSON 数组**（不是外包一层对象），每个元素字段：
 - \`index\`：清单里的**全局序号**（必填，不要改成本路 1..${count}）。
 - \`title\`：漏洞标题（核对用）。
-- \`verdict\`：\`true_positive\` / \`conditional\`（真实但需前置条件，**仍算真漏洞**）/ \`false_positive\` / \`design_decision\`。
+- \`verdict\`：\`true_positive\` / \`conditional\`（真实但需前置条件，**仍算真漏洞**）/ \`false_positive\` / \`design_decision\`（**仅当有依据认为该功能不构成任何真实安全影响**时才用；"有意设计的功能"本身不等于"安全"）。
 - \`verified_severity\`：critical/high/medium/low/info。
 - \`file\`、\`line\`：准确定位（沿用或修正）。
 - \`reason\`：验证依据（中文）——污点链是否可达、防御是否生效、为何这样判。
@@ -1199,10 +1199,13 @@ ${AUTH_MULTIPATH_RULE}
 
 # 验证与判定原则
 1. **复用已有污点链快速核验，不要从零重追**：只抽查关键跳与阻断点；仅当污点链明显不完整、断裂或存疑时才补读源码。
-2. **宁可保留，不可漏判**：只有确信防御有效或路径不可达才判 false_positive；拿不准一律 conditional。
+2. **宁可保留，不可漏判**：只有确信防御有效或路径不可达才判 false_positive；当候选存在合理、可解释的潜在安全影响，但利用条件或证据尚不完整时，归 conditional（仍算真漏洞）；不得仅凭"拿不准"就认定存在漏洞。
 3. 净化“看起来存在”不等于有效：只改变类型/容器却保留可控字节的包装不算净化；存在旁路直达 Sink 即 conditional。
 4. 不要因"需要权限/有前置条件"就判 false_positive——那属于 conditional。
 5. 未授权可达直达严重危害（RCE/任意文件读写/脱库/越权）→ verified_severity 保持 high/critical。
+6. **严禁仅因"需要管理员权限 / 用户主动确认 / 需特定配置 / 属于上传·安装·模板导入功能"就判 design_decision**——这些只是触发前置条件，本身不能证明功能安全；只要基于代码路径确认存在真实安全影响（可达的代码执行、文件写入、越权、敏感数据暴露等），就归 conditional。
+7. **design_decision 只用于"确认不存在真实安全后果"的场景**：判之前必须基于真实代码路径、可达性与权限边界，确认该功能无可达的代码执行/文件写入/越权/敏感数据暴露路径；不得因"这是有意设计的功能"就判 design_decision。
+8. **判定必须有代码依据，不得凭空判定**：design_decision 需确认"无真实安全影响"；conditional 需确认"有合理、可解释的潜在安全影响，但利用条件或证据尚不完整"；两者都不得仅凭"拿不准"就认定。拿不准时先补读源码核实关键跳与阻断点；核实后仍无法判断的，在 reason 里写明具体不确定性并保守归 conditional（留待远程实测复核），不得仅凭不确定性就判 false_positive 或 design_decision 而丢弃。
 
 # 结束
 ${endgame}
